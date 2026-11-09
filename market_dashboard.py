@@ -291,6 +291,55 @@ def fetch_btc_fg():
     return s.groupby(level=0).last().sort_index()
 
 
+_SH_HIST = None
+FG_COMP = {}  # 지수 구성 요소(최근값)
+
+
+def fetch_stockhub_fg(market):
+    """StockHub 공포탐욕지수(market='kr' 한국 · 'us' 미국/CNN) — 현재값 + 최근 30일"""
+    global _SH_HIST
+    cur = _get("https://stockhub.kr/api/fear-greed", params={"market": market},
+               headers={"Referer": "https://stockhub.kr/fear-greed"}).json()
+    if _SH_HIST is None:
+        _SH_HIST = _get("https://stockhub.kr/api/fear-greed/history", headers={"Referer": "https://stockhub.kr/fear-greed"}).json().get("data", [])
+    pts = [(x["date"], x.get(market)) for x in _SH_HIST if x.get(market) is not None]
+    s = pd.Series([float(v) for _, v in pts], index=pd.to_datetime([dd for dd, _ in pts]))
+    if cur.get("score") is not None:
+        ts = pd.Timestamp(cur.get("timestamp", TODAY.isoformat())[:10])
+        s.loc[ts] = float(cur["score"])
+        FG_COMP[market] = cur.get("indicators") or {}
+    return s.groupby(level=0).last().sort_index()
+
+
+def load_prev_dashboard():
+    """직전에 게시된 대시보드에서 차트 데이터를 읽어옴(출처가 짧은 기간만 주는 지표의 기록을 이어 붙이기 위함)"""
+    url = os.getenv("DASHBOARD_URL", "")
+    repo = os.getenv("GITHUB_REPOSITORY", "")
+    if not url and "/" in repo:
+        owner, name = repo.split("/", 1)
+        url = f"https://{owner.lower()}.github.io/{name}/"
+    if not url:
+        return {}
+    try:
+        html = _get(url, tries=2).text
+        m = re.search(r"const _P=(\{.*?\});const CH=", html, re.S)
+        return json.loads(m.group(1))["DATA"] if m else {}
+    except Exception as e:  # noqa
+        print("  [참고] 이전 대시보드 기록 없음:", str(e)[:60])
+        return {}
+
+
+def merge_prev(s, prev_data, key):
+    """이번에 받은 값 + 이전 대시보드에 남아 있던 값(겹치면 새 값 우선)"""
+    p = prev_data.get(key) or {}
+    if not p.get("t"):
+        return s
+    old = pd.Series(p["v"], index=pd.to_datetime(p["t"], unit="D"))
+    if s is None or len(s) == 0:
+        return old
+    return s.combine_first(old).sort_index()
+
+
 def fetch_ff_calendar():
     js = _get("https://nfs.faireconomy.media/ff_calendar_thisweek.json").json()
     return [x for x in js if x.get("country") in FF_COUNTRY and x.get("impact") in ("High", "Medium")]
@@ -351,8 +400,9 @@ SOURCES = {
     "WTI": lambda: fetch_fred("DCOILWTICO", LONG_START),
     # 시장 심리
     "VIX": lambda: fetch_fred("VIXCLS", LONG_START),
-    "FG_US": fetch_cnn_fg,
+    "FG_US": first_ok(fetch_cnn_fg, lambda: fetch_stockhub_fg("us")),
     "FG_BTC": fetch_btc_fg,
+    "FG_KR": lambda: fetch_stockhub_fg("kr"),
     "GOLD": lambda: fetch_yahoo("GC=F", LONG_START),
     "BTC": lambda: fetch_yahoo("BTC-USD", LONG_START),
     # 경제지표(원계열)
@@ -416,6 +466,9 @@ def fetch_all():
             raw["PX_" + code] = fetch_yahoo(code + (".KS" if mk == "1" else ".KQ"), p3)
         except Exception:
             pass
+    prev = load_prev_dashboard()
+    for k in ("FG_KR",):
+        raw[k] = merge_prev(raw.get(k), prev, k)
     print(f"실적 일정: 미국 {len(us_earn)}건 · 한국 {len(kr_earn)}건 · 한국 컨센서스 {sum(1 for v in kr_cons.values() if v)}건")
     return raw, ff, fr, {k: v for k, v in status.items() if v}, us_earn, kr_earn, kr_cons
 
@@ -510,11 +563,8 @@ def derive(raw):
     d["US_NFP"] = mdiff(g("PAYEMS")); d["US_UR"] = g("UNRATE")
     d["US_RS"] = mom(g("RSAFS")); d["KR_CPI_Y"] = yoy(g("KR_CPI"))
     d["BR_IPCA"] = g("BR_IPCA12")
-    d["FG_KR"] = kr_fear_greed(g("KOSPI"), g("USDKRW"))
     d["ICSA_K"] = g("ICSA") / 1000; d["JOLTS_M"] = g("JTSJOL") / 1000; d["INDPRO_Y"] = yoy(g("INDPRO"))
-    d["FG_US_PROXY"] = len(g("FG_US")) == 0
-    if d["FG_US_PROXY"]:
-        d["FG_US"] = us_fear_greed(g("SPX"), g("VIX"))
+    d["FG_US_PROXY"] = False
     if len(g("BR10Y")):
         d["BR10Y"] = g("BR10Y")[g("BR10Y") > 1]
     for name, hs in EXPORT_ITEMS:
@@ -589,7 +639,7 @@ RISK_CARDS = [
 SENT_LINE = [("st_vix", "VIX 변동성 지수", "VIX", 2, "FRED(CBOE)")]
 SENT_FG = [  # id, 제목, key, 출처
     ("st_fgus", "美 공포·탐욕 지수", "FG_US", "CNN Fear & Greed"),
-    ("st_fgkr", "韓 공포·탐욕 지수", "FG_KR", "자체 산출(코스피·원달러)"),
+    ("st_fgkr", "韓 공포·탐욕 지수", "FG_KR", "StockHub 한국 공포탐욕지수"),
     ("st_fgbtc", "비트코인 공포·탐욕 지수", "FG_BTC", "alternative.me"),
 ]
 FG_ZONES = [(0, 25, "극단적 공포"), (25, 45, "공포"), (45, 55, "중립"), (55, 75, "탐욕"), (75, 100.1, "극단적 탐욕")]
@@ -652,8 +702,6 @@ def build_charts(d):
                        "bands": [[30, 200, "--dn", .10], [20, 30, "--dn", .05]], "refs": [[20, "20"], [30, "30"]]}
         stats[cid] = card_stats(d, key, "level", dec)
     for cid, title, key, src in SENT_FG:
-        if key == "FG_US" and d.get("FG_US_PROXY"):
-            src = "자체 산출(CNN 접속 실패로 대체)"
         put(key, dec=1)
         charts[cid] = {"title": title, "src": src, "series": [{"k": key, "n": "지수", "c": RED, "w": 2.2}], "dec": 0, "unit": "",
                        "ymin": 0, "ymax": 100,
@@ -662,7 +710,8 @@ def build_charts(d):
         x = d.get(key, pd.Series(dtype=float)).dropna()
         if len(x) >= 2:
             ago = lambda days: asof(x, x.index[-1] - pd.Timedelta(days=days))
-            stats[cid] = {"val": float(x.iloc[-1]), "label": fg_label(x.iloc[-1]), "date": x.index[-1].strftime("%y.%m.%d"),
+            comp = FG_COMP.get({"FG_KR": "kr"}.get(key, ""), {})
+            stats[cid] = {"val": float(x.iloc[-1]), "label": fg_label(x.iloc[-1]), "date": x.index[-1].strftime("%y.%m.%d"), "comp": comp,
                           "hist": [[n, None if pd.isna(v) else float(v)] for n, v in (("전일", x.iloc[-2]), ("1주 전", ago(7)), ("1개월 전", ago(30)), ("1년 전", ago(365)))]}
         else:
             stats[cid] = {"val": None, "label": "수집 실패", "date": "", "hist": []}
@@ -1133,6 +1182,7 @@ section{margin-top:28px}
 .gauge{padding:10px 14px 8px;border-bottom:1px solid var(--bd2)}
 .gbar{position:relative;height:8px;background:linear-gradient(90deg,var(--dn) 0%,color-mix(in srgb,var(--dn) 45%,var(--panel)) 35%,var(--bd) 50%,color-mix(in srgb,var(--up) 45%,var(--panel)) 65%,var(--up) 100%);border-radius:1px}
 .gbar i{position:absolute;top:-5px;width:3px;height:18px;background:var(--tx);transform:translateX(-50%);box-shadow:0 0 0 2px var(--panel)}
+.fgc{display:flex;flex-wrap:wrap;gap:4px 12px;padding:7px 14px;border-bottom:1px solid var(--bd2);font-size:11px;color:var(--mute)}.fgc b{font-weight:700;margin-left:2px}
 .glab{display:flex;justify-content:space-between;font-size:10px;color:var(--mute);margin-top:6px}
 .up{color:var(--up)!important}.dn{color:var(--dn)!important}
 .body{padding:8px 10px 6px 4px}
@@ -1153,6 +1203,11 @@ table.cal{width:100%;border-collapse:collapse;font-size:13px}
 .cal .nm{white-space:normal;font-weight:500}
 .cal .imp{width:70px}.cal .imp i{display:inline-block;width:5px;height:11px;background:var(--c3);margin-right:2px;vertical-align:-1px}.cal .imp i.o{background:var(--bd)}
 .cal .n{text-align:right;width:120px}.cal .fc{font-weight:700;background:var(--fc);padding:2px 6px}.cal .na{color:var(--mute)}
+.calg{margin-bottom:18px}.calh{display:flex;align-items:baseline;gap:8px;margin:0 0 7px;flex-wrap:wrap}
+.calh b{font-size:15px;font-weight:700}.calh .cnt{font-size:11.5px;font-weight:700;color:var(--acc)}.calh small{font-size:11.5px;color:var(--mute)}
+.cal tr[data-more]{display:none}.cal tr[data-more].showmore{display:table-row}.cal tr.det[data-more]{display:none}
+.calp .more{display:block;width:100%;border:0;border-top:1px solid var(--bd2);background:var(--panel);color:var(--sub);font:inherit;font-size:12.5px;font-weight:600;padding:10px;cursor:pointer}
+.calp .more:hover{color:var(--tx);background:var(--bd2)}
 .ctabs{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
 .ctabs button{border:1px solid var(--bd);background:var(--panel);color:var(--sub);font:inherit;font-size:12.5px;font-weight:600;padding:6px 12px;cursor:pointer;border-radius:2px}
 .ctabs button.on{background:var(--hd);border-color:var(--hd);color:#fff}
@@ -1256,9 +1311,8 @@ drawAll();
 document.querySelectorAll('.cal tr.ev.x').forEach(tr=>tr.addEventListener('click',()=>{const det=tr.nextElementSibling;const open=det.hidden;det.hidden=!open;tr.classList.toggle('open',open);
  if(open){CS=getComputedStyle(document.documentElement);det.querySelectorAll('.panel[data-id]').forEach(draw)}}));
 document.querySelectorAll('.dp .per button').forEach(b=>b.addEventListener('click',ev=>{ev.stopPropagation();const p=b.closest('.dp');p.dataset.p=b.dataset.v;p.querySelectorAll('.per button').forEach(x=>x.classList.toggle('on',x===b));CS=getComputedStyle(document.documentElement);draw(p)}));
-document.querySelectorAll('.ctabs button').forEach(b=>b.addEventListener('click',()=>{const f=b.dataset.f;document.querySelectorAll('.ctabs button').forEach(x=>x.classList.toggle('on',x===b));
- document.querySelectorAll('.cal tbody tr').forEach(tr=>{if(tr.classList.contains('day'))return;const show=f==='all'||tr.dataset.k===f;if(tr.classList.contains('det')){if(!show)tr.hidden=true;else tr.hidden=!tr.previousElementSibling.classList.contains('open')}else tr.style.display=show?'':'none'});
- document.querySelectorAll('.cal tr.day').forEach(dr=>{let n=dr.nextElementSibling,vis=false;while(n&&!n.classList.contains('day')){if(n.classList.contains('ev')&&n.style.display!=='none')vis=true;n=n.nextElementSibling}dr.style.display=vis?'':'none'})}));
+document.querySelectorAll('.calp .more').forEach(b=>b.addEventListener('click',()=>{const tb=b.closest('.calp');const open=b.dataset.open!=='1';b.dataset.open=open?'1':'0';
+ tb.querySelectorAll('tr[data-more]').forEach(tr=>tr.classList.toggle('showmore',open));b.textContent=open?'접기 ▴':`나머지 ${b.dataset.n}건 더 보기 ▾`}));
 const navs=[...document.querySelectorAll('.nav a')];const io=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting)navs.forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+e.target.id))})},{rootMargin:'-40% 0px -55% 0px'});
 document.querySelectorAll('section').forEach(x=>io.observe(x));
 let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{drawAll();document.querySelectorAll('.cal tr.det:not([hidden]) .panel[data-id]').forEach(draw)},150)});
@@ -1304,6 +1358,9 @@ def card_html(cid, cfg, st, h, kind):
                 f'<div class="pv"><b class="{_fg_cls(v)}">{"-" if v is None else f"{v:.0f}"}</b><small class="{_fg_cls(v)}">{st["label"]}</small></div></div>'
                 f'<div class="gauge"><div class="gbar"><i style="left:{pos}%"></i></div><div class="glab"><span>극단적 공포</span><span>공포</span><span>중립</span><span>탐욕</span><span>극단적 탐욕</span></div></div>'
                 f'<div class="qs">{hist}</div>')
+        cn = {"momentum": "모멘텀", "strength": "주가강도", "volume": "시장폭", "breadth": "시장폭", "vix": "변동성", "safehaven": "안전자산"}
+        if st.get("comp"):
+            head += '<div class="fgc">' + "".join(f'<span>{cn.get(k, k)} <b class="{_fg_cls(v)}">{v:.0f}</b></span>' for k, v in st["comp"].items() if isinstance(v, (int, float))) + "</div>"
         return f'<div class="panel" data-id="{cid}">{head}<div class="body"><div class="plot" data-h="{h}"></div></div></div>'
     if kind == "market":
         qs = "".join(f"<div><span>{a}</span>{_arrow(c, b)}</div>" for a, b, c in st["ch"])
@@ -1322,43 +1379,61 @@ def section(en, sid, title, desc, opts, default, grid, cards):
             f'<div class="grid {grid}">{"".join(cards)}</div></section>')
 
 
-def calendar_html(ev):
-    if not ev:
-        return '<div class="calp" style="padding:20px;color:var(--mute)">예정된 일정이 없습니다.</div>'
+def _cal_table(items, cols_pv, cols_fc, folded=None):
+    """items: [(전체 인덱스, 이벤트)] → 날짜별로 묶은 표. folded(e)=True인 일정은 '더 보기'로 접어 둠"""
     wd = "월화수목금토일"
     code = {"미국": "US", "한국": "KR", "중국": "CN", "일본": "JP", "유로": "EU"}
-    kindlab = {"macro": "지표", "earn_us": "실적", "earn_kr": "실적"}
-    cnt = {k: sum(1 for e in ev if e.get("kind") == k) for k in ("macro", "earn_kr", "earn_us")}
-    tabs = (f'<div class="ctabs"><button class="on" data-f="all">전체 {len(ev)}</button><button data-f="macro">경제지표 {cnt["macro"]}</button>'
-            f'<button data-f="earn_kr">국내 실적 {cnt["earn_kr"]}</button><button data-f="earn_us">해외 실적 {cnt["earn_us"]}</button></div>')
     rows, cur = [], None
-    for i, e in enumerate(ev):
+    fold = {i: bool(folded and folded(e)) for i, e in items}
+    day_all_folded = {}
+    for i, e in items:
+        day_all_folded[e["t"].date()] = day_all_folded.get(e["t"].date(), True) and fold[i]
+    for i, e in items:
+        hide = ' data-more="1"' if fold[i] else ""
         dd = e["t"].date()
         if dd != cur:
             cur = dd
+            dhide = ' data-more="1"' if day_all_folded[dd] else ""
             tag = "<em>오늘</em>" if dd == TODAY else ("<em>내일</em>" if dd == TODAY + dt.timedelta(days=1) else "")
-            rows.append(f'<tr class="day"><td colspan="7">{dd:%m.%d} ({wd[dd.weekday()]}){tag}</td></tr>')
+            rows.append(f'<tr class="day"{dhide}><td colspan="7">{dd:%m.%d} ({wd[dd.weekday()]}){tag}</td></tr>')
         cc = code.get(e["cty"], e["cty"])
         imp = "<i></i>" * e["imp"] + '<i class="o"></i>' * (3 - e["imp"])
         fc = f'<span class="fc">{_esc(e["fc"])}</span>' if e.get("fc") else '<span class="na">-</span>'
         pv = _esc(e["pv"]) if e.get("pv") else '<span class="na">-</span>'
         tm = "미정" if e.get("notime") else f'{e["t"]:%H:%M}'
-        tag = f'<span class="kt {e.get("kind", "")}">{kindlab.get(e.get("kind"), "")}</span>'
         sub = f'<small>{_esc(e["tag"])}</small>' if e.get("tag") else ""
         has = bool(e.get("rows") or e.get("charts"))
-        rows.append(f'<tr class="ev{" x" if has else ""}" data-k="{e.get("kind", "")}" data-i="{i}"><td class="tm">{tm}</td><td class="cc"><span class="{cc}">{cc}</span></td>'
-                    f'<td class="nm">{tag}{_esc(e["name"])}{sub}</td><td class="imp">{imp}</td><td class="n pv2">{pv}</td><td class="n">{fc}</td>'
+        rows.append(f'<tr class="ev{" x" if has else ""}"{hide}><td class="tm">{tm}</td><td class="cc"><span class="{cc}">{cc}</span></td>'
+                    f'<td class="nm">{_esc(e["name"])}{sub}</td><td class="imp">{imp}</td><td class="n pv2">{pv}</td><td class="n">{fc}</td>'
                     f'<td class="ar">{"›" if has else ""}</td></tr>')
         if has:
             kv = "".join(f"<tr><td>{_esc(a)}</td><td>{_esc(b)}</td><td>{_esc(c)}</td></tr>" for a, b, c in e.get("rows", []))
             h = e.get("rows_hdr", ["항목", "값", "비고"])
-            charts = "".join(f'<div class="panel dp" data-id="cal_{i}_{j}" data-p="{e.get("per", "3Y")}"><div class="dph"><span>{_esc(ch[0][1])}</span>'
-                             f'<div class="per sm">' + "".join(f'<button data-v="{o}"{" class=on" if o == e.get("per", "3Y") else ""}>{o.replace("Y", "년")}</button>' for o in ("1Y", "3Y", "5Y")) +
+            per = e.get("per", "3Y")
+            charts = "".join(f'<div class="panel dp" data-id="cal_{i}_{j}" data-p="{per}"><div class="dph"><span>{_esc(ch[0][1])}</span>'
+                             f'<div class="per sm">' + "".join(f'<button data-v="{o}"{" class=on" if o == per else ""}>{o.replace("Y", "년")}</button>' for o in ("1Y", "3Y", "5Y")) +
                              f'</div></div><div class="plot" data-h="190"></div></div>' for j, ch in enumerate(e.get("charts", [])))
-            rows.append(f'<tr class="det" data-k="{e.get("kind", "")}" hidden><td colspan="7"><div class="detw"><table class="kv"><thead><tr><th>{h[0]}</th><th>{h[1]}</th><th>{h[2]}</th></tr></thead>'
+            rows.append(f'<tr class="det" hidden><td colspan="7"><div class="detw"><table class="kv"><thead><tr><th>{h[0]}</th><th>{h[1]}</th><th>{h[2]}</th></tr></thead>'
                         f'<tbody>{kv}</tbody></table><div class="dcharts">{charts}</div></div></td></tr>')
-    return (tabs + '<div class="calp"><table class="cal"><thead><tr><th>시간(KST)</th><th>국가</th><th>일정</th><th class="imp">중요도</th>'
-            '<th class="n pv2">이전 / 전년동기</th><th class="n">예상(컨센서스)</th><th></th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
+    nf = sum(fold.values())
+    more = f'<button class="more" data-n="{nf}">나머지 {nf}건 더 보기 ▾</button>' if nf else ""
+    return ('<div class="calp"><table class="cal"><thead><tr><th>시간(KST)</th><th>국가</th><th>일정</th><th class="imp">중요도</th>'
+            f'<th class="n pv2">{cols_pv}</th><th class="n">{cols_fc}</th><th></th></tr></thead><tbody>' + "".join(rows) + f"</tbody></table>{more}</div>")
+
+
+def calendar_html(ev):
+    wk = TODAY + dt.timedelta(days=7)
+    groups = [("macro", "경제지표", "美 주요 지표 · 한은 금통위 · 수출 / 줄을 누르면 전년비·전월비와 차트", "이전", "예상(컨센서스)", None),
+              ("earn_kr", "국내 실적발표", "KRX KIND 공시 일정(코스피·코스닥) · 컨센서스 단위 억원(영업이익) · 코스피 1주일 우선 표시, 나머지는 더 보기",
+               "전년 동기 영업이익", "영업이익 컨센서스", lambda e: e["t"].date() >= wk or e["imp"] < 2),
+              ("earn_us", "해외 실적발표", "미국 상장 시가총액 500억 달러 이상 · EPS 기준 · 1,000억 달러 이상 우선 표시",
+               "전년 동기 EPS", "EPS 컨센서스", lambda e: e["imp"] < 2)]
+    out = []
+    for kind, title, desc, pvh, fch, lim in groups:
+        items = [(i, e) for i, e in enumerate(ev) if e.get("kind", "macro") == kind]
+        body = _cal_table(items, pvh, fch, lim) if items else '<div class="calp" style="padding:16px 14px;color:var(--mute)">향후 3주 내 예정된 일정이 없습니다.</div>'
+        out.append(f'<div class="calg"><div class="calh"><b>{title}</b><span class="cnt">{len(items)}건</span><small>{desc}</small></div>{body}</div>')
+    return "".join(out)
 
 
 def calendar_charts(ev, d, charts, data):
@@ -1433,8 +1508,8 @@ def build_html(d, ev, status=None):
 <section id="cal"><div class="sh"><div><div class="en">CALENDAR</div><h2>향후 3주 주요 일정<small>한국시간 기준 · 줄을 누르면 상세(이전값·컨센서스·차트)가 펼쳐집니다</small></h2></div></div>{calendar_html(ev)}</section>
 {section("MACRO", "econ", "경제지표", "월간 발표치", ["1Y", "3Y", "5Y", "10Y"], "5Y", "g4", econ)}
 {section("EXPORTS", "exp", "품목별 수출", "관세청 HS 4단위, 억 달러 / 막대 월별 · 선 12개월 평균", ["3Y", "5Y", "10Y"], "10Y", "g4", exp)}
-<div class="note">출처: 한국은행 ECOS, FRED(세인트루이스 연준), Yahoo Finance, 일본 재무성, 브라질 중앙은행·국고청, 관세청, ForexFactory, Nasdaq(미국 실적·EPS 컨센서스), KRX KIND(국내 실적발표 일정), 네이버 금융(국내 실적 컨센서스, FnGuide 제공), CNN(Fear & Greed), alternative.me(Crypto Fear & Greed).
-韓 공포·탐욕 지수는 공식 지수가 없어 자체 산출: 코스피 125일 이평 괴리·52주 고저 위치·RSI(14)·20일 변동성(역)·원/달러 20일 변화(역)의 최근 3년 백분위 평균.
+<div class="note">출처: 한국은행 ECOS, FRED(세인트루이스 연준), Yahoo Finance, 일본 재무성, 브라질 중앙은행·국고청, 관세청, ForexFactory, Nasdaq(미국 실적·EPS 컨센서스), KRX KIND(국내 실적발표 일정), 네이버 금융(국내 실적 컨센서스, FnGuide 제공), CNN(Fear & Greed), StockHub(한국 공포탐욕), alternative.me(Crypto Fear & Greed).
+韓 공포·탐욕 지수는 StockHub(stockhub.kr) 공개값(모멘텀·주가강도·시장폭·변동성·안전자산 5개 지표 가중합). 출처가 최근 30일만 제공해 매일 실행 시 기록을 누적함.
 미국 30년물은 2002~2006년 발행 중단으로 해당 기간 공백. 브라질 국채는 Tesouro Direto 고정금리 이표채(NTN-F) 중 잔존 10년에 가장 가까운 종목(2000년대 초반은 단기물만 존재).
 금은 COMEX 선물 근월물. 품목별 수출은 HS 4단위 근사치로 산업부 품목 분류와 다를 수 있음(디스플레이 HS 8524는 2022년 신설). ▲ 상승 / ▼ 하락. 美 지표 '≈x.x% (추정)'은 시장 전월비 예상치를 계절조정 지수에 적용해 계산한 전년비 추정치로, 공식 컨센서스가 아님.
 {("수집 실패·캐시 사용: " + fails) if fails else ""}</div>
