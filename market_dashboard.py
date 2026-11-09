@@ -109,10 +109,33 @@ S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PB-dashboard"
 
 
-def _get(url, timeout=40, **kw):
-    r = S.get(url, timeout=timeout, **kw)
-    r.raise_for_status()
-    return r
+def _get(url, timeout=(15, 90), tries=3, **kw):
+    """접속 실패·서버 오류 시 최대 3번 재시도"""
+    for i in range(tries):
+        try:
+            r = S.get(url, timeout=timeout, **kw)
+            r.raise_for_status()
+            return r
+        except Exception:
+            if i == tries - 1:
+                raise
+            time.sleep(4 * (i + 1))
+
+
+def first_ok(*fns):
+    """앞의 소스가 실패하면 다음 소스로 대체"""
+    def run():
+        err = None
+        for fn in fns:
+            try:
+                s = fn()
+                if s is not None and len(s):
+                    return s
+            except Exception as e:  # noqa
+                err = e
+                print(f"    → 대체 소스 시도 ({str(e)[:80]})")
+        raise err or RuntimeError("모든 소스 실패")
+    return run
 
 
 def fetch_ecos(stat, cycle, item, start):
@@ -242,10 +265,9 @@ def fetch_customs(hs, years=EXPORT_YEARS):
 
 def fetch_cnn_fg():
     """CNN Fear & Greed (비공식 공개 JSON, 2020년~)"""
-    r = S.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2020-01-01", timeout=40,
+    r = _get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2020-01-01",
               headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
                        "Referer": "https://edition.cnn.com/", "Origin": "https://edition.cnn.com", "Accept": "application/json"})
-    r.raise_for_status()
     js = r.json()
     pts = js["fear_and_greed_historical"]["data"]
     s = pd.Series([float(x["y"]) for x in pts], index=pd.to_datetime([x["x"] for x in pts], unit="ms").normalize())
@@ -291,7 +313,7 @@ def with_cache(key, fn):
         print(f"  [실패] {key}: {e}")
         if path.exists():
             return pd.read_csv(path, index_col=0, parse_dates=True)["v"], "캐시"
-        return pd.Series(dtype=float), "실패"
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([])), "실패"
 
 
 SOURCES = {
@@ -311,12 +333,12 @@ SOURCES = {
     "BR10Y": lambda: fetch_tesouro_10y(LONG_START),
     "SELIC": lambda: fetch_bcb(432, dt.date(1999, 3, 5)),
     # 환율
-    "USDKRW": lambda: fetch_ecos("731Y001", "D", "0000001", LONG_START),
-    "JPYKRW": lambda: fetch_ecos("731Y001", "D", "0000002", LONG_START),
+    "USDKRW": first_ok(lambda: fetch_ecos("731Y001", "D", "0000001", LONG_START), lambda: fetch_yahoo("KRW=X", LONG_START)),
+    "JPYKRW": first_ok(lambda: fetch_ecos("731Y001", "D", "0000002", LONG_START), lambda: fetch_yahoo("JPYKRW=X", LONG_START) * 100),
     "USDBRL": lambda: fetch_bcb(1, dt.date(1994, 7, 1)),
     # 주식·원자재·코인
-    "KOSPI": lambda: fetch_ecos("802Y001", "D", "0001000", LONG_START),
-    "KOSDAQ": lambda: fetch_ecos("802Y001", "D", "0089000", LONG_START),
+    "KOSPI": first_ok(lambda: fetch_ecos("802Y001", "D", "0001000", LONG_START), lambda: fetch_yahoo("^KS11", LONG_START)),
+    "KOSDAQ": first_ok(lambda: fetch_ecos("802Y001", "D", "0089000", LONG_START), lambda: fetch_yahoo("^KQ11", LONG_START)),
     "SPX": lambda: fetch_yahoo("^GSPC", LONG_START),
     "NASDAQ": lambda: fetch_yahoo("^IXIC", LONG_START),
     "WTI": lambda: fetch_fred("DCOILWTICO", LONG_START),
@@ -334,7 +356,7 @@ SOURCES = {
     "PAYEMS": lambda: fetch_fred("PAYEMS", ECON_START),
     "UNRATE": lambda: fetch_fred("UNRATE", ECON_START),
     "RSAFS": lambda: fetch_fred("RSAFS", ECON_START),
-    "KR_CPI": lambda: fetch_ecos("901Y009", "M", "0", ECON_START),
+    "KR_CPI": first_ok(lambda: fetch_ecos("901Y009", "M", "0", ECON_START), lambda: fetch_fred("KORCPIALLMINMEI", ECON_START)),
     "BR_IPCA12": lambda: fetch_bcb(13522, ECON_START),
 }
 
@@ -372,18 +394,24 @@ ME = _me()
 
 
 def yoy(s):
+    if s is None or len(s) == 0 or not isinstance(s.index, pd.DatetimeIndex):
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     s = s.copy(); s.index = s.index.to_period("M").to_timestamp()
     p = s.copy(); p.index = p.index + pd.DateOffset(years=1)
     return ((s / p.reindex(s.index) - 1) * 100).dropna()
 
 
 def mom(s):
+    if s is None or len(s) == 0 or not isinstance(s.index, pd.DatetimeIndex):
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     s = s.copy(); s.index = s.index.to_period("M").to_timestamp()
     prev = s.copy(); prev.index = prev.index + pd.DateOffset(months=1)
     return ((s / prev.reindex(s.index) - 1) * 100).dropna()
 
 
 def mdiff(s):
+    if s is None or len(s) == 0 or not isinstance(s.index, pd.DatetimeIndex):
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     s = s.copy(); s.index = s.index.to_period("M").to_timestamp()
     prev = s.copy(); prev.index = prev.index + pd.DateOffset(months=1)
     return (s - prev.reindex(s.index)).dropna()
@@ -410,6 +438,26 @@ def kr_fear_greed(kospi, usdkrw):
     return pct.mean(axis=1, skipna=False).dropna().round(1)
 
 
+def us_fear_greed(spx, vix):
+    """CNN 접속이 막힐 때 쓰는 미국 공포·탐욕 대체 지수(자체 산출, 0~100)
+    S&P500 ① 125일 이평 괴리 ② 52주 위치 ③ RSI(14) ④ VIX(역) ⑤ VIX의 50일 평균 대비(역)"""
+    k = spx.dropna()
+    if len(k) < 900:
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
+    v = vix.reindex(k.index.union(vix.index)).ffill().reindex(k.index)
+    ret = k.pct_change()
+    up, dn = ret.clip(lower=0).rolling(14).mean(), (-ret.clip(upper=0)).rolling(14).mean()
+    comps = pd.DataFrame({
+        "mom": k / k.rolling(125).mean() - 1,
+        "pos": (k - k.rolling(250).min()) / (k.rolling(250).max() - k.rolling(250).min()),
+        "rsi": 100 - 100 / (1 + up / dn.replace(0, np.nan)),
+        "vix": -v,
+        "vixr": -(v / v.rolling(50).mean()),
+    })
+    pct = comps.rolling(750, min_periods=500).rank(pct=True) * 100
+    return pct.mean(axis=1, skipna=False).dropna().round(1)
+
+
 def derive(raw):
     d = dict(raw)
     a, b = raw.get("USDKRW", pd.Series(dtype=float)), raw.get("USDBRL", pd.Series(dtype=float))
@@ -423,6 +471,9 @@ def derive(raw):
     d["US_RS"] = mom(g("RSAFS")); d["KR_CPI_Y"] = yoy(g("KR_CPI"))
     d["BR_IPCA"] = g("BR_IPCA12")
     d["FG_KR"] = kr_fear_greed(g("KOSPI"), g("USDKRW"))
+    d["FG_US_PROXY"] = len(g("FG_US")) == 0
+    if d["FG_US_PROXY"]:
+        d["FG_US"] = us_fear_greed(g("SPX"), g("VIX"))
     if len(g("BR10Y")):
         d["BR10Y"] = g("BR10Y")[g("BR10Y") > 1]
     for name, hs in EXPORT_ITEMS:
@@ -560,6 +611,8 @@ def build_charts(d):
                        "bands": [[30, 200, "--dn", .10], [20, 30, "--dn", .05]], "refs": [[20, "20"], [30, "30"]]}
         stats[cid] = card_stats(d, key, "level", dec)
     for cid, title, key, src in SENT_FG:
+        if key == "FG_US" and d.get("FG_US_PROXY"):
+            src = "자체 산출(CNN 접속 실패로 대체)"
         put(key, dec=1)
         charts[cid] = {"title": title, "src": src, "series": [{"k": key, "n": "지수", "c": RED, "w": 2.2}], "dec": 0, "unit": "",
                        "ymin": 0, "ymax": 100,
