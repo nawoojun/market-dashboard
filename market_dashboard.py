@@ -25,6 +25,7 @@ import datetime as dt
 import io
 import json
 import os
+import re
 import time
 import warnings
 import xml.etree.ElementTree as ET
@@ -264,17 +265,23 @@ def fetch_customs(hs, years=EXPORT_YEARS):
 
 
 def fetch_cnn_fg():
-    """CNN Fear & Greed (비공식 공개 JSON, 2020년~)"""
-    r = _get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2020-01-01",
-              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                       "Referer": "https://edition.cnn.com/", "Origin": "https://edition.cnn.com", "Accept": "application/json"})
-    js = r.json()
-    pts = js["fear_and_greed_historical"]["data"]
-    s = pd.Series([float(x["y"]) for x in pts], index=pd.to_datetime([x["x"] for x in pts], unit="ms").normalize())
-    cur = js.get("fear_and_greed", {})
-    if cur.get("score") is not None and cur.get("timestamp"):
-        s.loc[pd.to_datetime(cur["timestamp"]).tz_localize(None).normalize()] = float(cur["score"])
-    return s.groupby(level=0).last().sort_index()
+    """CNN Fear & Greed (비공식 공개 JSON). 시작일이 2020-07-14보다 이르면 CNN 서버가 500 오류를 냄"""
+    hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+           "Accept": "application/json, text/plain, */*", "Referer": "https://edition.cnn.com/"}
+    base = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+    err = None
+    for start in ("2020-07-14", (TODAY - dt.timedelta(days=730)).isoformat(), ""):
+        try:
+            js = _get(base + (f"/{start}" if start else ""), headers=hdr, tries=2).json()
+            pts = js["fear_and_greed_historical"]["data"]
+            s = pd.Series([float(x["y"]) for x in pts], index=pd.to_datetime([x["x"] for x in pts], unit="ms").normalize())
+            cur = js.get("fear_and_greed", {})
+            if cur.get("score") is not None and cur.get("timestamp"):
+                s.loc[pd.to_datetime(cur["timestamp"]).tz_localize(None).normalize()] = float(cur["score"])
+            return s.groupby(level=0).last().sort_index()
+        except Exception as e:  # noqa
+            err = e
+    raise err
 
 
 def fetch_btc_fg():
@@ -358,6 +365,12 @@ SOURCES = {
     "RSAFS": lambda: fetch_fred("RSAFS", ECON_START),
     "KR_CPI": first_ok(lambda: fetch_ecos("901Y009", "M", "0", ECON_START), lambda: fetch_fred("KORCPIALLMINMEI", ECON_START)),
     "BR_IPCA12": lambda: fetch_bcb(13522, ECON_START),
+    # 일정 상세용
+    "ICSA": lambda: fetch_fred("ICSA", ECON_START),
+    "GDPGR": lambda: fetch_fred("A191RL1Q225SBEA", ECON_START),
+    "JTSJOL": lambda: fetch_fred("JTSJOL", ECON_START),
+    "UMCSENT": lambda: fetch_fred("UMCSENT", ECON_START),
+    "INDPRO": lambda: fetch_fred("INDPRO", ECON_START),
 }
 
 
@@ -377,7 +390,34 @@ def fetch_all():
         fr = fetch_fred_releases()
     except Exception as e:
         print("  [실패] FRED 일정:", e); fr = []
-    return raw, ff, fr, {k: v for k, v in status.items() if v}
+    # 실적 일정 · 컨센서스 · 주가
+    try:
+        us_earn = fetch_us_earnings()
+    except Exception as e:
+        print("  [실패] 미국 실적 일정:", e); us_earn = []
+    try:
+        kr_earn = [x for x in fetch_kr_earnings() if "실적" in x["title"] and x["code"]]
+    except Exception as e:
+        print("  [실패] 한국 실적 일정:", e); kr_earn = []
+    kr_cons = {}
+    p3 = TODAY - dt.timedelta(days=3 * 365)
+    for sym in sorted({r["symbol"] for r in us_earn})[:40]:
+        try:
+            raw["PX_" + sym] = fetch_yahoo(sym, p3)
+        except Exception:
+            pass
+    for code, mk in sorted({(x["code"] + "0" if len(x["code"]) == 5 else x["code"], x["mk"]) for x in kr_earn})[:60]:
+        try:
+            kr_cons[code] = fetch_naver_consensus(code)
+            time.sleep(0.3)
+        except Exception as e:
+            print("  [실패] 네이버 컨센서스", code, str(e)[:60])
+        try:
+            raw["PX_" + code] = fetch_yahoo(code + (".KS" if mk == "1" else ".KQ"), p3)
+        except Exception:
+            pass
+    print(f"실적 일정: 미국 {len(us_earn)}건 · 한국 {len(kr_earn)}건 · 한국 컨센서스 {sum(1 for v in kr_cons.values() if v)}건")
+    return raw, ff, fr, {k: v for k, v in status.items() if v}, us_earn, kr_earn, kr_cons
 
 
 # =====================================================================
@@ -471,6 +511,7 @@ def derive(raw):
     d["US_RS"] = mom(g("RSAFS")); d["KR_CPI_Y"] = yoy(g("KR_CPI"))
     d["BR_IPCA"] = g("BR_IPCA12")
     d["FG_KR"] = kr_fear_greed(g("KOSPI"), g("USDKRW"))
+    d["ICSA_K"] = g("ICSA") / 1000; d["JOLTS_M"] = g("JTSJOL") / 1000; d["INDPRO_Y"] = yoy(g("INDPRO"))
     d["FG_US_PROXY"] = len(g("FG_US")) == 0
     if d["FG_US_PROXY"]:
         d["FG_US"] = us_fear_greed(g("SPX"), g("VIX"))
@@ -676,38 +717,320 @@ def _next_bday(d):
     return d
 
 
-def build_calendar(ff, fred_rel):
+def _ffnum(x):
+    """'0.3%' '194K' '3.86M' → float (단위 제외)"""
+    if not x:
+        return None
+    try:
+        return float(str(x).replace("%", "").replace("K", "").replace("M", "").replace("B", "").replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def _m(s, months_back=0):
+    """월별 시계열의 최근값(또는 n개월 전)과 기준월"""
+    s = s.dropna()
+    if len(s) <= months_back:
+        return None, None
+    return float(s.iloc[-1 - months_back]), s.index[-1 - months_back]
+
+
+def _implied_yoy(idx, mm_fc):
+    """전월비 컨센서스로 추정한 전년비 = (최근 지수 × (1+전월비)) / 12개월 전 지수 - 1"""
+    idx = idx.dropna()
+    if mm_fc is None or len(idx) < 13:
+        return None
+    last = idx.index[-1]
+    nxt = (last + pd.DateOffset(months=1)).to_period("M").to_timestamp()
+    bp = (nxt - pd.DateOffset(years=1)).to_period("M")
+    per = idx.index.to_period("M")
+    base = idx[per == bp]
+    if base.empty:  # 기준월 공백(예: 2025년 10월 셧다운) → 앞뒤 달 기하평균으로 보간
+        a, b = idx[per == bp - 1], idx[per == bp + 1]
+        if a.empty or b.empty:
+            return None
+        bv = float(np.sqrt(a.iloc[0] * b.iloc[0]))
+    else:
+        bv = float(base.iloc[0])
+    return (idx.iloc[-1] * (1 + mm_fc / 100) / bv - 1) * 100
+
+
+def _fmt(v, dec=1, unit="%", sign=False):
+    if v is None or pd.isna(v):
+        return "-"
+    return f"{v:+,.{dec}f}{unit}" if sign else f"{v:,.{dec}f}{unit}"
+
+
+# 경제지표 그룹별: 표시 이름, 상세 행 정의, 차트 정의
+#  행: (라벨, 이전값 함수, ForexFactory 제목(예상), 예상값 가공)
+def macro_detail(grp, d, ffmap):
+    g = lambda k: d.get(k, pd.Series(dtype=float, index=pd.DatetimeIndex([])))
+    fc = lambda title: ffmap.get(title, {}).get("forecast")
+    pv = lambda title: ffmap.get(title, {}).get("previous")
+    rows, chart, main = [], None, None
+
+    def mrow(label, series, dec=1, unit="%", ff_title=None, implied=None, wfmt="%y.%m"):
+        v, when = _m(series)
+        if v is not None:
+            wl = f"{when.year % 100}.{(when.month - 1) // 3 + 1}Q" if wfmt == "Q" else when.strftime(wfmt)
+            prev = f"{_fmt(v, dec, unit)} ({wl})"
+        else:
+            prev = pv(ff_title) or "-"
+        f = fc(ff_title) if ff_title else None
+        if implied is not None:
+            f = f"≈{implied:.1f}% (추정)"
+        rows.append([label, prev, f or "-"])
+        return prev, (f or "")
+
+    if grp == "CPI":
+        yo = _implied_yoy(g("CPIAUCSL"), _ffnum(fc("CPI m/m")))
+        cyo = _implied_yoy(g("CPILFESL"), _ffnum(fc("Core CPI m/m")))
+        main = mrow("CPI 전년비", g("US_CPI"), implied=yo)
+        mrow("CPI 전월비", mom(g("CPIAUCSL")), ff_title="CPI m/m")
+        mrow("근원 CPI 전년비", g("US_CCPI"), implied=cyo)
+        mrow("근원 CPI 전월비", mom(g("CPILFESL")), ff_title="Core CPI m/m")
+        chart = [("US_CPI", "CPI 전년비", "--c1"), ("US_CCPI", "근원 CPI 전년비", "--c2")]
+    elif grp == "PPI":
+        yo = _implied_yoy(g("PPIFID"), _ffnum(fc("PPI m/m")))
+        main = mrow("PPI 전년비", g("US_PPI"), implied=yo)
+        mrow("PPI 전월비", mom(g("PPIFID")), ff_title="PPI m/m")
+        rows.append(["근원 PPI 전월비", pv("Core PPI m/m") or "-", fc("Core PPI m/m") or "-"])
+        chart = [("US_PPI", "PPI 전년비", "--c1")]
+    elif grp == "PCE":
+        yo = _implied_yoy(g("PCEPILFE"), _ffnum(fc("Core PCE Price Index m/m")))
+        main = mrow("근원 PCE 전년비", g("US_CPCE"), implied=yo)
+        mrow("근원 PCE 전월비", mom(g("PCEPILFE")), ff_title="Core PCE Price Index m/m")
+        chart = [("US_CPCE", "근원 PCE 전년비", "--c1")]
+    elif grp == "NFP":
+        main = mrow("비농업 고용(천명)", g("US_NFP"), 0, "", "Non-Farm Employment Change")
+        mrow("실업률", g("US_UR"), ff_title="Unemployment Rate")
+        rows.append(["시간당 임금 전월비", pv("Average Hourly Earnings m/m") or "-", fc("Average Hourly Earnings m/m") or "-"])
+        chart = [("US_NFP", "비농업 고용(천명)", "--c1", 1)]
+    elif grp == "RETAIL":
+        main = mrow("소매판매 전월비", g("US_RS"), ff_title="Retail Sales m/m")
+        rows.append(["근원 소매판매 전월비", pv("Core Retail Sales m/m") or "-", fc("Core Retail Sales m/m") or "-"])
+        chart = [("US_RS", "소매판매 전월비", "--c1", 1)]
+    elif grp == "CLAIMS":
+        main = mrow("신규 실업수당청구(천건)", g("ICSA_K"), 0, "K", "Unemployment Claims", wfmt="%m.%d")
+        chart = [("ICSA_K", "신규 실업수당청구(천건)", "--c1")]
+    elif grp == "GDP":
+        main = mrow("실질 GDP 성장률(연율)", g("GDPGR"), ff_title="Advance GDP q/q", wfmt="Q")
+        for t in ("Prelim GDP q/q", "Final GDP q/q"):
+            if fc(t):
+                rows[-1][2] = fc(t)
+        chart = [("GDPGR", "GDP 성장률(연율)", "--c1", 1)]
+    elif grp == "JOLTS":
+        main = mrow("JOLTS 구인건수(백만)", g("JOLTS_M"), 2, "M", "JOLTS Job Openings")
+        chart = [("JOLTS_M", "구인건수(백만)", "--c1")]
+    elif grp == "UOM":
+        main = mrow("미시간대 소비자심리", g("UMCSENT"), 1, "", "Prelim UoM Consumer Sentiment")
+        chart = [("UMCSENT", "소비자심리", "--c1")]
+    elif grp == "IP":
+        main = mrow("산업생산 전년비", g("INDPRO_Y"))
+        mrow("산업생산 전월비", mom(g("INDPRO")), ff_title="Industrial Production m/m")
+        chart = [("INDPRO_Y", "산업생산 전년비", "--c1")]
+    elif grp == "FOMC":
+        v, _ = _m(g("USFF"))
+        rows.append(["기준금리(상단)", _fmt(v, 2), fc("Federal Funds Rate") or "-"])
+        main = (rows[-1][1], rows[-1][2] if rows[-1][2] != "-" else "")
+        chart = [("USFF", "기준금리(상단)", "--c1", 0, 1)]
+    elif grp == "BOK":
+        v, _ = _m(g("KRBASE"))
+        rows.append(["한은 기준금리", _fmt(v, 2), "-"])
+        main = (rows[-1][1], "")
+        chart = [("KRBASE", "한은 기준금리", "--c1", 0, 1)]
+    elif grp == "KREXP":
+        for nm, hs in EXPORT_ITEMS[:4]:
+            s = g("EXP_" + hs)
+            if len(s) >= 13:
+                rows.append([f"{nm} 수출(최근월)", f"{s.iloc[-1]:,.1f}억$ ({s.index[-1]:%y.%m})", f"전년비 {(s.iloc[-1] / s.iloc[-13] - 1) * 100:+.1f}%"])
+        main = ("", "")
+        chart = [("EXP_8542", "반도체 월 수출(억$)", "--cb", 1, 0, 1), ("EXPMA_8542", "12개월 평균", "--c1")]
+    return rows, ([chart] if chart else []), main or ("", "")
+
+
+GRP_NAME = {"CPI": "소비자물가(CPI)", "PPI": "생산자물가(PPI)", "NFP": "고용보고서(비농업고용·실업률)", "PCE": "PCE 물가",
+            "GDP": "GDP", "RETAIL": "소매판매", "CLAIMS": "신규 실업수당청구", "JOLTS": "JOLTS 구인건수",
+            "UOM": "미시간대 소비자심리", "IP": "산업생산", "FOMC": "FOMC 기준금리 결정", "ISM": "ISM PMI",
+            "ECB": "ECB 통화정책", "BOJ": "BOJ 통화정책"}
+GRP_IMP = {"CPI": 3, "PPI": 3, "NFP": 3, "PCE": 3, "GDP": 3, "RETAIL": 3, "FOMC": 3, "CLAIMS": 2, "JOLTS": 2, "UOM": 2, "IP": 2, "ISM": 3}
+
+
+def fetch_us_earnings(min_cap=5e10):
+    """Nasdaq 실적발표 캘린더 — 시가총액 기준 대형주, EPS 컨센서스 포함"""
+    out = []
+    hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+           "Accept": "application/json, text/plain, */*", "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+    for i in range(0, 22):
+        day = TODAY + dt.timedelta(days=i)
+        if day.weekday() >= 5:
+            continue
+        try:
+            js = _get("https://api.nasdaq.com/api/calendar/earnings", params={"date": day.isoformat()}, headers=hdr, tries=2).json()
+        except Exception as e:
+            print("  [실패] Nasdaq 실적", day, str(e)[:60]); continue
+        for r in ((js.get("data") or {}).get("rows") or []):
+            cap = _ffnum((r.get("marketCap") or "").replace("$", "")) or 0
+            if cap >= min_cap and "." not in r.get("symbol", ""):
+                out.append({**r, "date": day.isoformat(), "cap": cap})
+    return out
+
+
+def fetch_kr_earnings():
+    """KRX KIND IR 일정 중 '실적' 발표 (코스피·코스닥)"""
+    out = []
+    for mk in ("1", "2"):
+        r = S.post("https://kind.krx.co.kr/corpgeneral/irschedule.do", timeout=60,
+                   headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest",
+                            "Referer": "https://kind.krx.co.kr/corpgeneral/irschedule.do?method=searchIRScheduleMain"},
+                   data={"method": "searchIRScheduleSub", "forward": "searchirschedule_sub", "currentPageSize": "3000", "pageIndex": "1",
+                         "orderMode": "4", "orderStat": "A", "fromDate": TODAY.isoformat(), "toDate": (TODAY + dt.timedelta(days=21)).isoformat(),
+                         "searchFromDate": TODAY.isoformat(), "searchToDate": (TODAY + dt.timedelta(days=21)).isoformat(), "marketType": mk})
+        html = r.content.decode("utf-8", errors="replace")
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
+            tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+            if len(tds) < 6:
+                continue
+            txt = lambda h: re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", h)).strip()
+            code = re.search(r"companysummary_open\('(\w+)'\)", tds[1])
+            out.append({"mk": mk, "corp": txt(tds[1]), "code": code.group(1) if code else "", "title": txt(tds[2]),
+                        "date": txt(tds[4]), "time": txt(tds[5])})
+    return out
+
+
+def fetch_naver_consensus(code6):
+    """네이버 금융 '기업실적분석' 표 — 분기 매출·영업이익·순이익 (E는 컨센서스, 억원)"""
+    html = _get(f"https://finance.naver.com/item/main.naver?code={code6}", tries=2).content.decode("euc-kr", errors="replace")
+    i = html.find("cop_analysis")
+    if i < 0:
+        return None
+    tb = html[i: html.find("</table>", i)]
+    txt = lambda h: re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", h))
+    thead = re.search(r"<thead>(.*?)</thead>", tb, re.S)
+    trs = re.findall(r"<tr[^>]*>(.*?)</tr>", thead.group(1), re.S) if thead else []
+    hdr = [txt(x) for x in re.findall(r"<th[^>]*>(.*?)</th>", trs[1], re.S)] if len(trs) > 1 else []
+    rows = {}
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tb[tb.find("<tbody"):], re.S):
+        th = re.search(r"<th[^>]*>(.*?)</th>", tr, re.S)
+        if th:
+            rows[txt(th.group(1))] = [txt(x) for x in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+    if len(hdr) < 10 or "영업이익" not in rows:
+        return None
+    q = hdr[-6:]
+    num = lambda v: _ffnum(v) if v not in ("", "-") else None
+    pick = lambda k: [num(x) for x in rows.get(k, [None] * 10)[-6:]]
+    return {"q": q, "sales": pick("매출액"), "op": pick("영업이익"), "np": pick("당기순이익")}
+
+
+def _kr_quarter(title):
+    m = re.search(r"'?(\d{2,4})\s*(?:년|회계연도|년도)?\D{0,8}?([1-4])\s*분기", title) or re.search(r"([1-4])Q\s*'?(\d{2,4})", title)
+    if not m:
+        return None
+    y, q = (m.group(1), m.group(2)) if "분기" in m.group(0) else (m.group(2), m.group(1))
+    y = int(y) + (2000 if len(y) == 2 else 0)
+    return f"{y}.{int(q) * 3:02d}"
+
+
+def build_calendar(ff, fred_rel, d=None, us_earn=None, kr_earn=None, kr_cons=None):
+    d = d or {}
     start, end = NOW - dt.timedelta(hours=6), NOW + dt.timedelta(days=21)
-    ev, seen = [], set()
+    ev = []
+    # 1) 경제지표: (날짜, 그룹) 단위로 묶기
+    groups = {}
     for x in ff:
         t = dt.datetime.fromisoformat(x["date"]).astimezone(KST)
-        name, grp = FF_TITLES.get(x["title"], (x["title"], x["title"]))
-        if x["impact"] == "Medium" and not x.get("forecast") and "Chair" not in x["title"]:
+        name, grp = FF_TITLES.get(x["title"], (x["title"], None))
+        if grp is None:  # 그룹 없는 일정(연설 등)
+            if x["impact"] == "High" or "Chair" in x["title"]:
+                ev.append({"t": t, "cty": FF_COUNTRY[x["country"]], "name": name, "imp": 3 if x["impact"] == "High" else 2,
+                           "fc": x.get("forecast") or "", "pv": x.get("previous") or "", "kind": "macro"})
             continue
-        ev.append({"t": t, "cty": FF_COUNTRY[x["country"]], "name": name, "imp": 3 if x["impact"] == "High" else 2,
-                   "fc": x.get("forecast") or "", "pv": x.get("previous") or ""})
-        seen.add((t.date(), grp))
+        if x["country"] != "USD":
+            ev.append({"t": t, "cty": FF_COUNTRY[x["country"]], "name": name, "imp": 3 if x["impact"] == "High" else 2,
+                       "fc": x.get("forecast") or "", "pv": x.get("previous") or "", "kind": "macro"})
+            continue
+        gk = (t.date(), grp)
+        groups.setdefault(gk, {"t": t, "ff": {}})["ff"][x["title"]] = x
+        groups[gk]["t"] = min(groups[gk]["t"], t)
     for date_str, rname in fred_rel:
         for k, (name, et, imp, grp) in US_RELEASES.items():
             if rname.startswith(k):
                 t = et_to_kst(date_str, et)
-                if (t.date(), grp) in seen:
-                    continue
-                seen.add((t.date(), grp))
-                ev.append({"t": t, "cty": "미국", "name": name, "imp": imp, "fc": "", "pv": ""})
+                groups.setdefault((t.date(), grp), {"t": t, "ff": {}})
     for ds in FOMC_DATES:
         t = et_to_kst(ds, "14:00")
-        if (t.date(), "FOMC") not in seen:
-            ev.append({"t": t, "cty": "미국", "name": "FOMC 기준금리 결정", "imp": 3, "fc": "", "pv": ""})
+        groups.setdefault((t.date(), "FOMC"), {"t": t, "ff": {}})
+    for (day, grp), gi in groups.items():
+        rows, chart, (pv, fc) = macro_detail(grp, d, gi["ff"])
+        ev.append({"t": gi["t"], "cty": "미국", "name": GRP_NAME.get(grp, grp), "imp": GRP_IMP.get(grp, 2), "pv": pv, "fc": fc,
+                   "kind": "macro", "rows": rows, "charts": chart, "rows_hdr": ["지표", "이전", "예상"], "per": "3Y"})
     for ds in BOK_DATES:
-        d = dt.date.fromisoformat(ds)
-        ev.append({"t": dt.datetime(d.year, d.month, d.day, 10, 0, tzinfo=KST), "cty": "한국", "name": "한은 금통위 기준금리 결정", "imp": 3, "fc": "", "pv": ""})
-    # 한국 수출입 (관세청 1~10일·1~20일 잠정치, 산업부 월간)
+        day = dt.date.fromisoformat(ds)
+        rows, chart, (pv, fc) = macro_detail("BOK", d, {})
+        ev.append({"t": dt.datetime(day.year, day.month, day.day, 10, 0, tzinfo=KST), "cty": "한국", "name": "한은 금통위 기준금리 결정",
+                   "imp": 3, "pv": pv, "fc": fc, "kind": "macro", "rows": rows, "charts": chart, "rows_hdr": ["지표", "현재", "예상"], "per": "5Y"})
     for k in range(0, 2):
         y, m = (TODAY.year, TODAY.month + k) if TODAY.month + k <= 12 else (TODAY.year + 1, 1)
-        for day, nm in ((1, "월간 수출입동향"), (11, "1~10일 수출(관세청 잠정)"), (21, "1~20일 수출(관세청 잠정)")):
-            d = _next_bday(dt.date(y, m, day))
-            ev.append({"t": dt.datetime(d.year, d.month, d.day, 9, 0, tzinfo=KST), "cty": "한국", "name": nm, "imp": 2, "fc": "", "pv": ""})
+        for dd, nm in ((1, "월간 수출입동향(산업부)"), (11, "1~10일 수출(관세청 잠정)"), (21, "1~20일 수출(관세청 잠정)")):
+            day = _next_bday(dt.date(y, m, dd))
+            rows, chart, _ = macro_detail("KREXP", d, {})
+            ev.append({"t": dt.datetime(day.year, day.month, day.day, 9, 0, tzinfo=KST), "cty": "한국", "name": nm, "imp": 2, "pv": "", "fc": "",
+                       "kind": "macro", "rows": rows, "charts": chart, "rows_hdr": ["품목", "최근", "전년비"], "per": "3Y"})
+    # 2) 미국 실적
+    for r in (us_earn or []):
+        tm = r.get("time", "")
+        if "pre" in tm:
+            t, when = et_to_kst(r["date"], "07:00"), "장 시작 전"
+        elif "after" in tm:
+            t, when = et_to_kst(r["date"], "16:05"), "장 마감 후"
+        else:
+            t, when = et_to_kst(r["date"], "12:00"), "시간 미정"
+        eps, ly = _ffnum((r.get("epsForecast") or "").replace("$", "")), _ffnum((r.get("lastYearEPS") or "").replace("$", ""))
+        cap = r["cap"]
+        growth = f"{(eps / ly - 1) * 100:+.0f}%" if eps is not None and ly not in (None, 0) and ly > 0 else "-"
+        rows = [["회계분기", r.get("fiscalQuarterEnding", "-"), ""], ["EPS 컨센서스", r.get("epsForecast") or "-", f"애널리스트 {r.get('noOfEsts', '-')}명"],
+                ["전년 동기 EPS", r.get("lastYearEPS") or "-", f"예상 증가율 {growth}"], ["시가총액", f"${cap / 1e9:,.0f}B", when]]
+        sym = r["symbol"]
+        ev.append({"t": t, "cty": "미국", "name": f'{re.sub(r",? (Inc\.|Incorporated|Corporation|Holdings? Inc\.|Ltd\.|plc|Limited|Company|Co\.)\b", "", r["name"]).strip()} ({sym})',
+                   "imp": 3 if cap >= 5e11 else 2 if cap >= 1e11 else 1, "pv": r.get("lastYearEPS") or "", "fc": r.get("epsForecast") or "",
+                   "kind": "earn_us", "tag": when, "rows": rows, "rows_hdr": ["항목", "값", "비고"],
+                   "charts": [[("PX_" + sym, f"{sym} 주가($)", "--c1")]], "per": "1Y"})
+    # 3) 한국 실적
+    seen = set()
+    for r in (kr_earn or []):
+        if "실적" not in r["title"] or not r["code"]:
+            continue
+        key = (r["corp"], r["date"])
+        if key in seen:
+            continue
+        seen.add(key)
+        day = dt.date.fromisoformat(r["date"])
+        hh, mm_ = (r["time"].split(":") + ["0"])[:2] if re.match(r"\d", r["time"]) else ("0", "0")
+        t = dt.datetime(day.year, day.month, day.day, int(hh), int(mm_), tzinfo=KST)
+        code6 = r["code"] + "0" if len(r["code"]) == 5 else r["code"]
+        qlab = _kr_quarter(r["title"])
+        cons = (kr_cons or {}).get(code6)
+        pv = fc = ""
+        rows = [["발표", r["title"], r["time"] if re.match(r"\d", r["time"]) else "시간 미정"]]
+        charts = [[("PX_" + code6, "주가(원)", "--c1")]]
+        if cons and qlab:
+            idx = next((i for i, h in enumerate(cons["q"]) if h.startswith(qlab)), None)
+            pidx = next((i for i, h in enumerate(cons["q"]) if h.startswith(f"{int(qlab[:4]) - 1}{qlab[4:]}")), None)
+            if idx is not None:
+                est = "(E)" in cons["q"][idx]
+                for nm, kk in (("매출액", "sales"), ("영업이익", "op"), ("순이익", "np")):
+                    cur = cons[kk][idx]; prv = cons[kk][pidx] if pidx is not None else None
+                    yo = f" ({(cur / prv - 1) * 100:+.0f}%)" if cur is not None and prv not in (None, 0) and prv > 0 and cur > 0 else ""
+                    rows.append([f"{nm} {'컨센서스' if est else '실적'}(억원)", _fmt(cur, 0, ""), f"전년 동기 {_fmt(prv, 0, '')}{yo}"])
+                op, pop = cons["op"][idx], cons["op"][pidx] if pidx is not None else None
+                pv, fc = (_fmt(pop, 0, "억") if pop is not None else ""), (_fmt(op, 0, "억") if (op is not None and est) else "")
+            opq = [(h, v) for h, v in zip(cons["q"], cons["op"]) if v is not None]
+            if opq:
+                d["OPQ_" + code6] = pd.Series([v for h, v in opq], index=pd.to_datetime([h[:7].replace(".", "-") + "-01" for h, v in opq]))
+                charts.insert(0, [("OPQ_" + code6, "분기 영업이익(억원) · 마지막 막대(E)=컨센서스", "--c2", 1, 0, 1)])
+        ev.append({"t": t, "cty": "한국", "name": f'{r["corp"]} {qlab[2:4] + "년 " + str(int(qlab[5:]) // 3) + "Q " if qlab else ""}실적',
+                   "imp": 2 if r["mk"] == "1" else 1, "pv": pv, "fc": fc, "kind": "earn_kr", "rows": rows, "rows_hdr": ["항목", "값", "비고"],
+                   "charts": charts, "per": "1Y", "notime": not re.match(r"\d", r["time"])})
     ev = [e for e in ev if start <= e["t"] <= end]
     ev.sort(key=lambda e: (e["t"], -e["imp"]))
     return ev
@@ -780,6 +1103,23 @@ table.cal{width:100%;border-collapse:collapse;font-size:13px}
 .cal .nm{white-space:normal;font-weight:500}
 .cal .imp{width:70px}.cal .imp i{display:inline-block;width:5px;height:11px;background:var(--c3);margin-right:2px;vertical-align:-1px}.cal .imp i.o{background:var(--bd)}
 .cal .n{text-align:right;width:120px}.cal .fc{font-weight:700;background:var(--fc);padding:2px 6px}.cal .na{color:var(--mute)}
+.ctabs{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.ctabs button{border:1px solid var(--bd);background:var(--panel);color:var(--sub);font:inherit;font-size:12.5px;font-weight:600;padding:6px 12px;cursor:pointer;border-radius:2px}
+.ctabs button.on{background:var(--hd);border-color:var(--hd);color:#fff}
+.cal tr.ev.x{cursor:pointer}.cal tr.ev.x:hover td{background:var(--bd2)}.cal tr.ev.open td{background:var(--bd2)}
+.cal .ar{width:28px;text-align:center;color:var(--mute);font-size:18px;transition:transform .15s}.cal tr.open .ar{transform:rotate(90deg);color:var(--acc)}
+.cal .nm small{display:inline-block;margin-left:8px;font-size:11px;color:var(--mute)}
+.kt{display:inline-block;font-size:10.5px;font-weight:700;padding:1px 6px;margin-right:8px;border-radius:2px;background:var(--bd2);color:var(--sub)}
+.kt.earn_kr,.kt.earn_us{background:color-mix(in srgb,var(--c3) 18%,var(--panel));color:color-mix(in srgb,var(--c3) 70%,var(--tx))}
+.cal tr.det td{padding:0;background:var(--bg);white-space:normal}
+.detw{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:12px;padding:12px}
+.kv{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--bd);font-size:12.5px;align-self:start}
+.kv th{background:var(--bd2);font-size:11px;color:var(--sub);text-align:left;padding:7px 10px}.kv td{padding:7px 10px;border-top:1px solid var(--bd2)}
+.kv td:nth-child(2){font-weight:700;white-space:nowrap}.kv td:nth-child(3){color:var(--sub)}
+.dcharts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
+.dph{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 10px 0 12px;font-size:12px;font-weight:700;color:var(--sub)}
+.per.sm button{padding:3px 8px;font-size:11px}
+@media(max-width:700px){.detw{grid-template-columns:1fr}}
 .note{margin-top:30px;font-size:11.5px;color:var(--mute);line-height:1.7;border-top:1px solid var(--bd);padding-top:12px}
 @media(max-width:700px){.g2,.g3,.g4{grid-template-columns:1fr}.hd h1 span,.hd .live{display:none}.wrap{padding:4px 12px 40px}.hd .in,.nav .in,.tk .in{padding:0 12px}
 .cal .pv2,.cal .imp{display:none}.cal .n{width:auto}.qs div{padding:6px 8px}}
@@ -796,7 +1136,7 @@ function el(tag,at,par){const e=document.createElementNS(NS,tag);for(const k in 
 let CS;const cv=c=>c&&c.startsWith('--')?CS.getPropertyValue(c).trim():c;
 const FONT="Pretendard,'Malgun Gothic',sans-serif";
 function draw(card){
- const id=card.dataset.id,cfg=CH[id],per=card.closest('section').dataset.p,box=card.querySelector('.plot');
+ const id=card.dataset.id,cfg=CH[id],per=card.dataset.p||card.closest('[data-p]').dataset.p,box=card.querySelector('.plot');
  const W=box.clientWidth,H=+box.dataset.h; if(!W)return;
  const K={grid:cv('--grid'),axis:cv('--axis'),pos:cv('--up'),neg:cv('--dn'),panel:cv('--panel'),badge:cv('--badge'),tx:cv('--tx')};
  const tmax=Math.max(...cfg.series.map(s=>{const t=DATA[s.k].t;return t.length?t[t.length-1]:-1e9}));
@@ -853,7 +1193,7 @@ function draw(card){
  const out=()=>{vl.setAttribute('visibility','hidden');tip.style.display='none'};
  hit.addEventListener('pointermove',mv);hit.addEventListener('pointerdown',mv);hit.addEventListener('pointerleave',out);
 }
-function drawSec(sec){sec.querySelectorAll('.panel[data-id]').forEach(draw)}
+function drawSec(sec){sec.querySelectorAll('.panel[data-id]:not(.dp)').forEach(draw)}
 function drawAll(){CS=getComputedStyle(document.documentElement);document.querySelectorAll('section[data-p]').forEach(drawSec)}
 try{const th=localStorage.getItem('theme');if(th)document.documentElement.dataset.theme=th}catch(e){}
 document.getElementById('thm').onclick=()=>{const r=document.documentElement,n=r.dataset.theme==='dark'?'light':'dark';r.dataset.theme=n;try{localStorage.setItem('theme',n)}catch(e){}drawAll()};
@@ -863,9 +1203,15 @@ document.querySelectorAll('section[data-p]').forEach(sec=>{
  sec.querySelectorAll('.per button').forEach(b=>{b.classList.toggle('on',b.dataset.v===sec.dataset.p);
   b.onclick=()=>{sec.dataset.p=b.dataset.v;sec.querySelectorAll('.per button').forEach(x=>x.classList.toggle('on',x===b));try{localStorage.setItem('p_'+sec.id,b.dataset.v)}catch(e){}CS=getComputedStyle(document.documentElement);drawSec(sec)}})});
 drawAll();
+document.querySelectorAll('.cal tr.ev.x').forEach(tr=>tr.addEventListener('click',()=>{const det=tr.nextElementSibling;const open=det.hidden;det.hidden=!open;tr.classList.toggle('open',open);
+ if(open){CS=getComputedStyle(document.documentElement);det.querySelectorAll('.panel[data-id]').forEach(draw)}}));
+document.querySelectorAll('.dp .per button').forEach(b=>b.addEventListener('click',ev=>{ev.stopPropagation();const p=b.closest('.dp');p.dataset.p=b.dataset.v;p.querySelectorAll('.per button').forEach(x=>x.classList.toggle('on',x===b));CS=getComputedStyle(document.documentElement);draw(p)}));
+document.querySelectorAll('.ctabs button').forEach(b=>b.addEventListener('click',()=>{const f=b.dataset.f;document.querySelectorAll('.ctabs button').forEach(x=>x.classList.toggle('on',x===b));
+ document.querySelectorAll('.cal tbody tr').forEach(tr=>{if(tr.classList.contains('day'))return;const show=f==='all'||tr.dataset.k===f;if(tr.classList.contains('det')){if(!show)tr.hidden=true;else tr.hidden=!tr.previousElementSibling.classList.contains('open')}else tr.style.display=show?'':'none'});
+ document.querySelectorAll('.cal tr.day').forEach(dr=>{let n=dr.nextElementSibling,vis=false;while(n&&!n.classList.contains('day')){if(n.classList.contains('ev')&&n.style.display!=='none')vis=true;n=n.nextElementSibling}dr.style.display=vis?'':'none'})}));
 const navs=[...document.querySelectorAll('.nav a')];const io=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting)navs.forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+e.target.id))})},{rootMargin:'-40% 0px -55% 0px'});
 document.querySelectorAll('section').forEach(x=>io.observe(x));
-let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(drawAll,150)});
+let rt;window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{drawAll();document.querySelectorAll('.cal tr.det:not([hidden]) .panel[data-id]').forEach(draw)},150)});
 """
 
 
@@ -931,21 +1277,58 @@ def calendar_html(ev):
         return '<div class="calp" style="padding:20px;color:var(--mute)">예정된 일정이 없습니다.</div>'
     wd = "월화수목금토일"
     code = {"미국": "US", "한국": "KR", "중국": "CN", "일본": "JP", "유로": "EU"}
+    kindlab = {"macro": "지표", "earn_us": "실적", "earn_kr": "실적"}
+    cnt = {k: sum(1 for e in ev if e.get("kind") == k) for k in ("macro", "earn_kr", "earn_us")}
+    tabs = (f'<div class="ctabs"><button class="on" data-f="all">전체 {len(ev)}</button><button data-f="macro">경제지표 {cnt["macro"]}</button>'
+            f'<button data-f="earn_kr">국내 실적 {cnt["earn_kr"]}</button><button data-f="earn_us">해외 실적 {cnt["earn_us"]}</button></div>')
     rows, cur = [], None
-    for e in ev:
-        d = e["t"].date()
-        if d != cur:
-            cur = d
-            tag = "<em>오늘</em>" if d == TODAY else ("<em>내일</em>" if d == TODAY + dt.timedelta(days=1) else "")
-            rows.append(f'<tr class="day"><td colspan="6">{d:%m.%d} ({wd[d.weekday()]}){tag}</td></tr>')
+    for i, e in enumerate(ev):
+        dd = e["t"].date()
+        if dd != cur:
+            cur = dd
+            tag = "<em>오늘</em>" if dd == TODAY else ("<em>내일</em>" if dd == TODAY + dt.timedelta(days=1) else "")
+            rows.append(f'<tr class="day"><td colspan="7">{dd:%m.%d} ({wd[dd.weekday()]}){tag}</td></tr>')
         cc = code.get(e["cty"], e["cty"])
         imp = "<i></i>" * e["imp"] + '<i class="o"></i>' * (3 - e["imp"])
-        fc = f'<span class="fc">{_esc(e["fc"])}</span>' if e["fc"] else '<span class="na">-</span>'
-        pv = _esc(e["pv"]) if e["pv"] else '<span class="na">-</span>'
-        rows.append(f'<tr><td class="tm">{e["t"]:%H:%M}</td><td class="cc"><span class="{cc}">{cc}</span></td><td class="nm">{_esc(e["name"])}</td>'
-                    f'<td class="imp">{imp}</td><td class="n pv2">{pv}</td><td class="n">{fc}</td></tr>')
-    return ('<div class="calp"><table class="cal"><thead><tr><th>시간(KST)</th><th>국가</th><th>지표</th><th class="imp">중요도</th>'
-            '<th class="n pv2">이전</th><th class="n">예상(컨센서스)</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
+        fc = f'<span class="fc">{_esc(e["fc"])}</span>' if e.get("fc") else '<span class="na">-</span>'
+        pv = _esc(e["pv"]) if e.get("pv") else '<span class="na">-</span>'
+        tm = "미정" if e.get("notime") else f'{e["t"]:%H:%M}'
+        tag = f'<span class="kt {e.get("kind", "")}">{kindlab.get(e.get("kind"), "")}</span>'
+        sub = f'<small>{_esc(e["tag"])}</small>' if e.get("tag") else ""
+        has = bool(e.get("rows") or e.get("charts"))
+        rows.append(f'<tr class="ev{" x" if has else ""}" data-k="{e.get("kind", "")}" data-i="{i}"><td class="tm">{tm}</td><td class="cc"><span class="{cc}">{cc}</span></td>'
+                    f'<td class="nm">{tag}{_esc(e["name"])}{sub}</td><td class="imp">{imp}</td><td class="n pv2">{pv}</td><td class="n">{fc}</td>'
+                    f'<td class="ar">{"›" if has else ""}</td></tr>')
+        if has:
+            kv = "".join(f"<tr><td>{_esc(a)}</td><td>{_esc(b)}</td><td>{_esc(c)}</td></tr>" for a, b, c in e.get("rows", []))
+            h = e.get("rows_hdr", ["항목", "값", "비고"])
+            charts = "".join(f'<div class="panel dp" data-id="cal_{i}_{j}" data-p="{e.get("per", "3Y")}"><div class="dph"><span>{_esc(ch[0][1])}</span>'
+                             f'<div class="per sm">' + "".join(f'<button data-v="{o}"{" class=on" if o == e.get("per", "3Y") else ""}>{o.replace("Y", "년")}</button>' for o in ("1Y", "3Y", "5Y")) +
+                             f'</div></div><div class="plot" data-h="190"></div></div>' for j, ch in enumerate(e.get("charts", [])))
+            rows.append(f'<tr class="det" data-k="{e.get("kind", "")}" hidden><td colspan="7"><div class="detw"><table class="kv"><thead><tr><th>{h[0]}</th><th>{h[1]}</th><th>{h[2]}</th></tr></thead>'
+                        f'<tbody>{kv}</tbody></table><div class="dcharts">{charts}</div></div></td></tr>')
+    return (tabs + '<div class="calp"><table class="cal"><thead><tr><th>시간(KST)</th><th>국가</th><th>일정</th><th class="imp">중요도</th>'
+            '<th class="n pv2">이전 / 전년동기</th><th class="n">예상(컨센서스)</th><th></th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
+
+
+def calendar_charts(ev, d, charts, data):
+    for i, e in enumerate(ev):
+        for j, ch in enumerate(e.get("charts", [])):
+            ser, mags, monthly = [], [], True
+            for tup in ch:
+                k, n, c = tup[:3]
+                bar, step, mono = (list(tup[3:]) + [0, 0, 0])[:3]
+                s = d.get(k, pd.Series(dtype=float, index=pd.DatetimeIndex([]))).dropna()
+                daily = k.startswith("PX_") or k in ("USFF", "KRBASE", "ICSA_K")
+                monthly = monthly and not daily
+                if k not in data:
+                    data[k] = pack(s, daily=daily, dec=3)
+                if len(s):
+                    mags.append(float(s.abs().median()))
+                ser.append({"k": k, "n": n, "c": c, "w": 2.2, "bar": bar, "step": step, "mono": mono})
+            m = max(mags) if mags else 1
+            charts[f"cal_{i}_{j}"] = {"title": "", "src": "", "series": ser, "dec": 0 if m >= 1000 else 1 if m >= 10 else 2,
+                                      "unit": "", "zero": 1 if any(x["bar"] for x in ser) else 0, "monthly": 1 if monthly else 0}
 
 
 TICKER = [("코스피", "KOSPI", 2, "level"), ("코스닥", "KOSDAQ", 2, "level"), ("S&P 500", "SPX", 2, "level"),
@@ -973,6 +1356,7 @@ def ticker_html(d):
 
 def build_html(d, ev, status=None):
     charts, data, stats = build_charts(d)
+    calendar_charts(ev, d, charts, data)
     for cid in charts:
         if cid.startswith(("ec_", "ex_")):
             charts[cid]["monthly"] = 1
@@ -996,13 +1380,13 @@ def build_html(d, ev, status=None):
 {section("FX", "fx", "환율", "원화 기준 / 원·헤알 = 원·달러 ÷ 달러·헤알", L, "30Y", "g3", fx)}
 {section("EQUITY · COMMODITY · CRYPTO", "risk", "주식 · 원자재 · 코인", "종가 기준", L, "30Y", "g3", risk)}
 {section("SENTIMENT", "sent", "시장 심리", "VIX · 공포탐욕 지수(0 극단적 공포 ~ 100 극단적 탐욕)", ["1Y", "3Y", "5Y", "10Y", "30Y"], "3Y", "g4", sent)}
-<section id="cal"><div class="sh"><div><div class="en">CALENDAR</div><h2>향후 3주 주요 일정<small>한국시간 기준 / 예상치는 시장 컨센서스(발표 주간 제공)</small></h2></div></div>{calendar_html(ev)}</section>
+<section id="cal"><div class="sh"><div><div class="en">CALENDAR</div><h2>향후 3주 주요 일정<small>한국시간 기준 · 줄을 누르면 상세(이전값·컨센서스·차트)가 펼쳐집니다</small></h2></div></div>{calendar_html(ev)}</section>
 {section("MACRO", "econ", "경제지표", "월간 발표치", ["1Y", "3Y", "5Y", "10Y"], "5Y", "g4", econ)}
 {section("EXPORTS", "exp", "품목별 수출", "관세청 HS 4단위, 억 달러 / 막대 월별 · 선 12개월 평균", ["3Y", "5Y", "10Y"], "10Y", "g4", exp)}
-<div class="note">출처: 한국은행 ECOS, FRED(세인트루이스 연준), Yahoo Finance, 일본 재무성, 브라질 중앙은행·국고청, 관세청, ForexFactory, CNN(Fear & Greed), alternative.me(Crypto Fear & Greed).
+<div class="note">출처: 한국은행 ECOS, FRED(세인트루이스 연준), Yahoo Finance, 일본 재무성, 브라질 중앙은행·국고청, 관세청, ForexFactory, Nasdaq(미국 실적·EPS 컨센서스), KRX KIND(국내 실적발표 일정), 네이버 금융(국내 실적 컨센서스, FnGuide 제공), CNN(Fear & Greed), alternative.me(Crypto Fear & Greed).
 韓 공포·탐욕 지수는 공식 지수가 없어 자체 산출: 코스피 125일 이평 괴리·52주 고저 위치·RSI(14)·20일 변동성(역)·원/달러 20일 변화(역)의 최근 3년 백분위 평균.
 미국 30년물은 2002~2006년 발행 중단으로 해당 기간 공백. 브라질 국채는 Tesouro Direto 고정금리 이표채(NTN-F) 중 잔존 10년에 가장 가까운 종목(2000년대 초반은 단기물만 존재).
-금은 COMEX 선물 근월물. 품목별 수출은 HS 4단위 근사치로 산업부 품목 분류와 다를 수 있음(디스플레이 HS 8524는 2022년 신설). ▲ 상승 / ▼ 하락.
+금은 COMEX 선물 근월물. 품목별 수출은 HS 4단위 근사치로 산업부 품목 분류와 다를 수 있음(디스플레이 HS 8524는 2022년 신설). ▲ 상승 / ▼ 하락. 美 지표 '≈x.x% (추정)'은 시장 전월비 예상치를 계절조정 지수에 적용해 계산한 전년비 추정치로, 공식 컨센서스가 아님.
 {("수집 실패·캐시 사용: " + fails) if fails else ""}</div>
 </main>"""
     payload = json.dumps({"CH": charts, "DATA": data}, ensure_ascii=False, separators=(",", ":"))
@@ -1017,9 +1401,9 @@ def build_html(d, ev, status=None):
 # 7. 실행
 # =====================================================================
 def main():
-    raw, ff, fr, status = fetch_all()
+    raw, ff, fr, status, us_earn, kr_earn, kr_cons = fetch_all()
     d = derive(raw)
-    ev = build_calendar(ff, fr)
+    ev = build_calendar(ff, fr, d, us_earn, kr_earn, kr_cons)
     html = build_html(d, ev, status)
     (OUT_DIR / f"dashboard_{TODAY:%Y%m%d}.html").write_text(html, encoding="utf-8")
     (OUT_DIR / "dashboard_latest.html").write_text(html, encoding="utf-8")
