@@ -240,6 +240,28 @@ def fetch_customs(hs, years=EXPORT_YEARS):
     return s.sort_index()
 
 
+def fetch_cnn_fg():
+    """CNN Fear & Greed (비공식 공개 JSON, 2020년~)"""
+    r = S.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2020-01-01", timeout=40,
+              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                       "Referer": "https://edition.cnn.com/", "Origin": "https://edition.cnn.com", "Accept": "application/json"})
+    r.raise_for_status()
+    js = r.json()
+    pts = js["fear_and_greed_historical"]["data"]
+    s = pd.Series([float(x["y"]) for x in pts], index=pd.to_datetime([x["x"] for x in pts], unit="ms").normalize())
+    cur = js.get("fear_and_greed", {})
+    if cur.get("score") is not None and cur.get("timestamp"):
+        s.loc[pd.to_datetime(cur["timestamp"]).tz_localize(None).normalize()] = float(cur["score"])
+    return s.groupby(level=0).last().sort_index()
+
+
+def fetch_btc_fg():
+    """alternative.me Crypto Fear & Greed (2018년~)"""
+    js = _get("https://api.alternative.me/fng/", params={"limit": 0, "format": "json"}).json()
+    s = pd.Series([float(x["value"]) for x in js["data"]], index=pd.to_datetime([int(x["timestamp"]) for x in js["data"]], unit="s").normalize())
+    return s.groupby(level=0).last().sort_index()
+
+
 def fetch_ff_calendar():
     js = _get("https://nfs.faireconomy.media/ff_calendar_thisweek.json").json()
     return [x for x in js if x.get("country") in FF_COUNTRY and x.get("impact") in ("High", "Medium")]
@@ -298,6 +320,10 @@ SOURCES = {
     "SPX": lambda: fetch_yahoo("^GSPC", LONG_START),
     "NASDAQ": lambda: fetch_yahoo("^IXIC", LONG_START),
     "WTI": lambda: fetch_fred("DCOILWTICO", LONG_START),
+    # 시장 심리
+    "VIX": lambda: fetch_fred("VIXCLS", LONG_START),
+    "FG_US": fetch_cnn_fg,
+    "FG_BTC": fetch_btc_fg,
     "GOLD": lambda: fetch_yahoo("GC=F", LONG_START),
     "BTC": lambda: fetch_yahoo("BTC-USD", LONG_START),
     # 경제지표(원계열)
@@ -363,6 +389,27 @@ def mdiff(s):
     return (s - prev.reindex(s.index)).dropna()
 
 
+def kr_fear_greed(kospi, usdkrw):
+    """한국 공포·탐욕 지수(자체 산출, 0~100)
+    코스피 ① 125일 이평 대비 괴리 ② 52주 고저 내 위치 ③ RSI(14) ④ 20일 변동성(역) ⑤ 원/달러 20일 변화(역)
+    각 요소를 최근 3년 백분위(0~100)로 바꿔 평균"""
+    k = kospi.dropna()
+    if len(k) < 900:
+        return pd.Series(dtype=float)
+    fx = usdkrw.reindex(k.index.union(usdkrw.index)).ffill().reindex(k.index)
+    ret = k.pct_change()
+    up, dn = ret.clip(lower=0).rolling(14).mean(), (-ret.clip(upper=0)).rolling(14).mean()
+    comps = pd.DataFrame({
+        "mom": k / k.rolling(125).mean() - 1,
+        "pos": (k - k.rolling(250).min()) / (k.rolling(250).max() - k.rolling(250).min()),
+        "rsi": 100 - 100 / (1 + up / dn.replace(0, np.nan)),
+        "vol": -ret.rolling(20).std(),
+        "fx": -fx.pct_change(20),
+    })
+    pct = comps.rolling(750, min_periods=500).rank(pct=True) * 100
+    return pct.mean(axis=1, skipna=False).dropna().round(1)
+
+
 def derive(raw):
     d = dict(raw)
     a, b = raw.get("USDKRW", pd.Series(dtype=float)), raw.get("USDBRL", pd.Series(dtype=float))
@@ -375,6 +422,7 @@ def derive(raw):
     d["US_NFP"] = mdiff(g("PAYEMS")); d["US_UR"] = g("UNRATE")
     d["US_RS"] = mom(g("RSAFS")); d["KR_CPI_Y"] = yoy(g("KR_CPI"))
     d["BR_IPCA"] = g("BR_IPCA12")
+    d["FG_KR"] = kr_fear_greed(g("KOSPI"), g("USDKRW"))
     if len(g("BR10Y")):
         d["BR10Y"] = g("BR10Y")[g("BR10Y") > 1]
     for name, hs in EXPORT_ITEMS:
@@ -446,6 +494,19 @@ RISK_CARDS = [
     ("rk_wti", "WTI 유가 ($/배럴)", "WTI", 2, "FRED"), ("rk_gold", "금 ($/온스, 선물)", "GOLD", 1, "Yahoo"),
     ("rk_btc", "비트코인 ($)", "BTC", 0, "Yahoo"),
 ]
+SENT_LINE = [("st_vix", "VIX 변동성 지수", "VIX", 2, "FRED(CBOE)")]
+SENT_FG = [  # id, 제목, key, 출처
+    ("st_fgus", "美 공포·탐욕 지수", "FG_US", "CNN Fear & Greed"),
+    ("st_fgkr", "韓 공포·탐욕 지수", "FG_KR", "자체 산출(코스피·원달러)"),
+    ("st_fgbtc", "비트코인 공포·탐욕 지수", "FG_BTC", "alternative.me"),
+]
+FG_ZONES = [(0, 25, "극단적 공포"), (25, 45, "공포"), (45, 55, "중립"), (55, 75, "탐욕"), (75, 100.1, "극단적 탐욕")]
+
+
+def fg_label(v):
+    return next(n for a, b, n in FG_ZONES if a <= v < b)
+
+
 ECON_CARDS = [  # id, 제목, [(key, 이름, 색)], 형태, 단위, 소수, 출처
     ("ec_uscpi", "美 소비자물가 (전년비)", [("US_CPI", "CPI", RED), ("US_CCPI", "근원 CPI", BLUE)], "line", "%", 1, "FRED"),
     ("ec_usppi", "美 생산자물가 (전년비)", [("US_PPI", "PPI 최종수요", RED)], "line", "%", 1, "FRED"),
@@ -493,6 +554,24 @@ def build_charts(d):
         charts[cid] = {"title": title, "src": src, "series": [{"k": key, "n": title, "c": {"SPX": BLUE, "NASDAQ": BLUE, "WTI": DARK, "GOLD": DARK, "BTC": "--c4"}.get(key, RED), "w": 2.2}],
                        "dec": dec, "unit": ""}
         stats[cid] = card_stats(d, key, "level", dec)
+    for cid, title, key, dec, src in SENT_LINE:
+        put(key)
+        charts[cid] = {"title": title, "src": src, "series": [{"k": key, "n": "VIX", "c": DARK, "w": 2.2}], "dec": dec, "unit": "",
+                       "bands": [[30, 200, "--dn", .10], [20, 30, "--dn", .05]], "refs": [[20, "20"], [30, "30"]]}
+        stats[cid] = card_stats(d, key, "level", dec)
+    for cid, title, key, src in SENT_FG:
+        put(key, dec=1)
+        charts[cid] = {"title": title, "src": src, "series": [{"k": key, "n": "지수", "c": RED, "w": 2.2}], "dec": 0, "unit": "",
+                       "ymin": 0, "ymax": 100,
+                       "bands": [[0, 25, "--dn", .16], [25, 45, "--dn", .07], [55, 75, "--up", .07], [75, 100, "--up", .16]],
+                       "refs": [[25, "25"], [50, "50"], [75, "75"]]}
+        x = d.get(key, pd.Series(dtype=float)).dropna()
+        if len(x) >= 2:
+            ago = lambda days: asof(x, x.index[-1] - pd.Timedelta(days=days))
+            stats[cid] = {"val": float(x.iloc[-1]), "label": fg_label(x.iloc[-1]), "date": x.index[-1].strftime("%y.%m.%d"),
+                          "hist": [[n, None if pd.isna(v) else float(v)] for n, v in (("전일", x.iloc[-2]), ("1주 전", ago(7)), ("1개월 전", ago(30)), ("1년 전", ago(365)))]}
+        else:
+            stats[cid] = {"val": None, "label": "수집 실패", "date": "", "hist": []}
     for cid, title, lines, form, unit, dec, src in ECON_CARDS:
         ser = []
         for k, n, c in lines:
@@ -624,7 +703,11 @@ section{margin-top:28px}
 .pv{text-align:right;white-space:nowrap}.pv b{font-size:20px;font-weight:700;letter-spacing:-.4px}.pv small{display:block;font-size:11px;color:var(--mute);margin-top:1px}
 .qs{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--bd2)}
 .qs div{padding:6px 14px;border-right:1px solid var(--bd2)}.qs div:last-child{border-right:0}
-.qs span{display:block;font-size:10.5px;color:var(--mute)}.qs b{font-size:12.5px;font-weight:700}
+.qs span{display:block;font-size:10.5px;color:var(--mute)}.qs b{font-size:12.5px;font-weight:700;white-space:nowrap}
+.gauge{padding:10px 14px 8px;border-bottom:1px solid var(--bd2)}
+.gbar{position:relative;height:8px;background:linear-gradient(90deg,var(--dn) 0%,color-mix(in srgb,var(--dn) 45%,var(--panel)) 35%,var(--bd) 50%,color-mix(in srgb,var(--up) 45%,var(--panel)) 65%,var(--up) 100%);border-radius:1px}
+.gbar i{position:absolute;top:-5px;width:3px;height:18px;background:var(--tx);transform:translateX(-50%);box-shadow:0 0 0 2px var(--panel)}
+.glab{display:flex;justify-content:space-between;font-size:10px;color:var(--mute);margin-top:6px}
 .up{color:var(--up)!important}.dn{color:var(--dn)!important}
 .body{padding:8px 10px 6px 4px}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--sub);padding:2px 10px 2px 10px}
@@ -670,7 +753,7 @@ function draw(card){
  let x0=Math.min(...S.map(s=>Math.max(s.t[0],t0))),x1=tmax;if(x1-x0<20)x0=x1-20;
  let lo=Infinity,hi=-Infinity;for(const s of S)for(let i=0;i<s.t.length;i++){if(s.t[i]<x0&&!s.step)continue;lo=Math.min(lo,s.v[i]);hi=Math.max(hi,s.v[i])}
  if(cfg.zero||S.some(s=>s.bar)){lo=Math.min(lo,0);hi=Math.max(hi,0)}
- const pad=(hi-lo)*.07||1;lo-=pad;hi+=pad;
+ if(cfg.ymin!=null){lo=cfg.ymin;hi=cfg.ymax}else{const pad=(hi-lo)*.07||1;lo-=pad;hi+=pad}
  const labs=S.filter(s=>!s.nolabel);const lw=Math.max(...labs.map(s=>fmt(s.v[s.v.length-1],cfg.dec).length))*7.6+22;
  const L=10,R=Math.max(52,lw)+46,T=8,B=22,pw=W-L-R,ph=H-T-B;
  const X=t=>L+(t-x0)/(x1-x0)*pw,Y=v=>T+(hi-v)/(hi-lo)*ph;
@@ -686,6 +769,8 @@ function draw(card){
  el('line',{x1:L,x2:L+pw,y1:T+ph,y2:T+ph,stroke:K.axis,'stroke-width':.8},svg);
  const clip='c'+id;const cp=el('clipPath',{id:clip},el('defs',{},svg));el('rect',{x:L,y:0,width:pw,height:H},cp);
  const g=el('g',{'clip-path':`url(#${clip})`},svg);
+ for(const [a,b,c,o] of (cfg.bands||[])){const ya=Y(Math.min(b,hi)),yb=Y(Math.max(a,lo));if(yb>ya)el('rect',{x:L,y:ya,width:pw,height:yb-ya,fill:cv(c),opacity:o},g)}
+ for(const [v,lab] of (cfg.refs||[])){if(v<lo||v>hi)continue;el('line',{x1:L,x2:L+pw,y1:Y(v),y2:Y(v),stroke:K.axis,'stroke-dasharray':'4 3','stroke-width':.8,opacity:.8},g)}
  for(const s of S){
   if(s.bar){const n=s.t.filter(t=>t>=x0).length||1,bw=Math.max(1,pw/n*.7),yz=Y(0);
    for(let i=0;i<s.t.length;i++){if(s.t[i]<x0)continue;const v=s.v[i],y=Y(v);el('rect',{x:X(s.t[i])-bw/2,y:Math.min(y,yz),width:bw,height:Math.max(1,Math.abs(yz-y)),fill:s.mono?s.col:(v>=0?K.pos:K.neg)},g)}continue}
@@ -757,7 +842,20 @@ def _arrow(c, txt):
     return f'<b class="{"up" if c > 0 else "dn" if c < 0 else ""}">{"▲" if c > 0 else "▼" if c < 0 else ""} {txt.lstrip("+-")}</b>'
 
 
+def _fg_cls(v):
+    return "dn" if v is not None and v < 45 else "up" if v is not None and v >= 55 else ""
+
+
 def card_html(cid, cfg, st, h, kind):
+    if kind == "gauge":
+        v = st.get("val")
+        pos = 0 if v is None else max(0, min(100, v))
+        hist = "".join(f'<div><span>{n}</span><b class="{_fg_cls(x)}">{"-" if x is None else f"{x:.0f} " + fg_label(x).replace("극단적 ", "극")}</b></div>' for n, x in st["hist"])
+        head = (f'<div class="ph"><div class="pt">{_esc(cfg["title"])}<small>{_esc(cfg["src"])} · {st["date"]}</small></div>'
+                f'<div class="pv"><b class="{_fg_cls(v)}">{"-" if v is None else f"{v:.0f}"}</b><small class="{_fg_cls(v)}">{st["label"]}</small></div></div>'
+                f'<div class="gauge"><div class="gbar"><i style="left:{pos}%"></i></div><div class="glab"><span>극단적 공포</span><span>공포</span><span>중립</span><span>탐욕</span><span>극단적 탐욕</span></div></div>'
+                f'<div class="qs">{hist}</div>')
+        return f'<div class="panel" data-id="{cid}">{head}<div class="body"><div class="plot" data-h="{h}"></div></div></div>'
     if kind == "market":
         qs = "".join(f"<div><span>{a}</span>{_arrow(c, b)}</div>" for a, b, c in st["ch"])
         main = f'{_esc(st["main"])} · ' if st.get("main") else ""
@@ -799,7 +897,7 @@ def calendar_html(ev):
 
 TICKER = [("코스피", "KOSPI", 2, "level"), ("코스닥", "KOSDAQ", 2, "level"), ("S&P 500", "SPX", 2, "level"),
           ("나스닥", "NASDAQ", 2, "level"), ("원/달러", "USDKRW", 1, "level"), ("원/100엔", "JPYKRW", 2, "level"),
-          ("국고 10년", "KR10Y", 3, "rate"), ("美국채 10년", "US10Y", 2, "rate"), ("WTI", "WTI", 2, "level"),
+          ("국고 10년", "KR10Y", 3, "rate"), ("美국채 10년", "US10Y", 2, "rate"), ("VIX", "VIX", 2, "level"), ("WTI", "WTI", 2, "level"),
           ("금", "GOLD", 1, "level"), ("비트코인", "BTC", 0, "level")]
 
 
@@ -829,6 +927,8 @@ def build_html(d, ev, status=None):
     fx = [card_html(c[0], charts[c[0]], stats[c[0]], 230, "market") for c in FX_CARDS]
     risk = [card_html(c[0], charts[c[0]], stats[c[0]], 220, "market") for c in RISK_CARDS]
     econ = [card_html(c[0], charts[c[0]], stats[c[0]], 200, "econ") for c in ECON_CARDS]
+    sent = [card_html(c[0], charts[c[0]], stats[c[0]], 200, "market") for c in SENT_LINE] + \
+           [card_html(c[0], charts[c[0]], stats[c[0]], 170, "gauge") for c in SENT_FG]
     exp = [card_html("ex_" + hs, charts["ex_" + hs], stats["ex_" + hs], 180, "econ") for _, hs in EXPORT_ITEMS]
     wd = "월화수목금토일"
     fails = ", ".join(f"{k}({v})" for k, v in (status or {}).items())
@@ -837,15 +937,17 @@ def build_html(d, ev, status=None):
 <header class="hd"><div class="in"><div class="logo">PB</div><h1>Market Monitor<span>금리 · 환율 · 자산 · 경제지표 · 수출</span></h1>
 <div class="rt"><span class="live">{TODAY:%Y.%m.%d}({wd[TODAY.weekday()]}) {NOW:%H:%M} 기준</span><button class="thm" id="thm">화면 전환</button></div></div></header>
 <div class="tk"><div class="in">{ticker_html(d)}</div></div>
-<div class="nav"><div class="in"><a href="#rates">금리</a><a href="#fx">환율</a><a href="#risk">주식·원자재·코인</a><a href="#cal">주요 일정</a><a href="#econ">경제지표</a><a href="#exp">품목별 수출</a></div></div>
+<div class="nav"><div class="in"><a href="#rates">금리</a><a href="#fx">환율</a><a href="#risk">주식·원자재·코인</a><a href="#sent">시장 심리</a><a href="#cal">주요 일정</a><a href="#econ">경제지표</a><a href="#exp">품목별 수출</a></div></div>
 <main class="wrap">
 {section("RATES", "rates", "금리", "국채 3·10·30년 / 점선 기준금리", L, "30Y", "g2", rates)}
 {section("FX", "fx", "환율", "원화 기준 / 원·헤알 = 원·달러 ÷ 달러·헤알", L, "30Y", "g3", fx)}
 {section("EQUITY · COMMODITY · CRYPTO", "risk", "주식 · 원자재 · 코인", "종가 기준", L, "30Y", "g3", risk)}
+{section("SENTIMENT", "sent", "시장 심리", "VIX · 공포탐욕 지수(0 극단적 공포 ~ 100 극단적 탐욕)", ["1Y", "3Y", "5Y", "10Y", "30Y"], "3Y", "g4", sent)}
 <section id="cal"><div class="sh"><div><div class="en">CALENDAR</div><h2>향후 3주 주요 일정<small>한국시간 기준 / 예상치는 시장 컨센서스(발표 주간 제공)</small></h2></div></div>{calendar_html(ev)}</section>
 {section("MACRO", "econ", "경제지표", "월간 발표치", ["1Y", "3Y", "5Y", "10Y"], "5Y", "g4", econ)}
 {section("EXPORTS", "exp", "품목별 수출", "관세청 HS 4단위, 억 달러 / 막대 월별 · 선 12개월 평균", ["3Y", "5Y", "10Y"], "10Y", "g4", exp)}
-<div class="note">출처: 한국은행 ECOS, FRED(세인트루이스 연준), Yahoo Finance, 일본 재무성, 브라질 중앙은행·국고청, 관세청, ForexFactory.
+<div class="note">출처: 한국은행 ECOS, FRED(세인트루이스 연준), Yahoo Finance, 일본 재무성, 브라질 중앙은행·국고청, 관세청, ForexFactory, CNN(Fear & Greed), alternative.me(Crypto Fear & Greed).
+韓 공포·탐욕 지수는 공식 지수가 없어 자체 산출: 코스피 125일 이평 괴리·52주 고저 위치·RSI(14)·20일 변동성(역)·원/달러 20일 변화(역)의 최근 3년 백분위 평균.
 미국 30년물은 2002~2006년 발행 중단으로 해당 기간 공백. 브라질 국채는 Tesouro Direto 고정금리 이표채(NTN-F) 중 잔존 10년에 가장 가까운 종목(2000년대 초반은 단기물만 존재).
 금은 COMEX 선물 근월물. 품목별 수출은 HS 4단위 근사치로 산업부 품목 분류와 다를 수 있음(디스플레이 HS 8524는 2022년 신설). ▲ 상승 / ▼ 하락.
 {("수집 실패·캐시 사용: " + fails) if fails else ""}</div>
