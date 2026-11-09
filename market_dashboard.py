@@ -990,34 +990,86 @@ def _parse_fin_table(tb):
 _NAVER_DIAG = []
 
 
+def _cons_from_naver_api(js):
+    """네이버 증권(Npay) 모바일 API 분기 재무 JSON → 표준 형태"""
+    def find(o):
+        if isinstance(o, dict):
+            if "trTitleList" in o and "rowList" in o:
+                return o
+            for v in o.values():
+                r = find(v)
+                if r:
+                    return r
+        elif isinstance(o, list):
+            for v in o:
+                r = find(v)
+                if r:
+                    return r
+        return None
+    fi = find(js)
+    if not fi:
+        return None
+    cols = []
+    for t in fi["trTitleList"]:
+        key, title = str(t.get("key", "")), str(t.get("title", ""))
+        m = re.search(r"(20\d{2})[./]?(\d{2})", title) or re.search(r"(20\d{2})(\d{2})", key)
+        if m:
+            cols.append((key, f"{m.group(1)}.{m.group(2)}" + ("(E)" if str(t.get("isConsensus", "N")).upper() == "Y" else "")))
+    rows = {}
+    for r in fi["rowList"]:
+        lab = str(r.get("title", "")).replace(" ", "")
+        for k, names in (("sales", ("매출액", "영업수익", "순영업수익")), ("op", ("영업이익",)), ("np", ("당기순이익", "지배주주순이익"))):
+            if k not in rows and any(lab.startswith(n) for n in names) and "률" not in lab:
+                c = r.get("columns", {})
+                rows[k] = [_ffnum((c.get(key) or {}).get("value", "")) if (c.get(key) or {}).get("value") not in (None, "", "-") else None for key, _ in cols]
+    if len(cols) < 4 or "op" not in rows:
+        return None
+    return {"q": [h for _, h in cols][-6:], "sales": rows.get("sales", [None] * len(cols))[-6:], "op": rows["op"][-6:], "np": rows.get("np", [None] * len(cols))[-6:]}
+
+
+_NAVER_DIAG = []
+
+
+def _diag(msg):
+    if len(_NAVER_DIAG) < 8:
+        _NAVER_DIAG.append(msg)
+        print("    [진단]", msg)
+
+
 def fetch_naver_consensus(code6):
-    """분기 매출·영업이익·순이익 컨센서스(억원). ① 네이버 금융 기업실적분석 ② 와이즈리포트(네이버 기업정보) 분기 재무"""
-    r = _get(f"https://finance.naver.com/item/main.naver?code={code6}", tries=2,
-             headers={"Referer": "https://finance.naver.com/", "Accept-Language": "ko-KR,ko;q=0.9"})
-    html = _decode_kr(r.content)
-    i = html.find("cop_analysis")
-    if i >= 0:
-        tb = html[i: html.find("</table>", i)]
-        # 네이버 표는 연간 4칸 + 분기 6칸 → 분기만 사용
-        res = _parse_fin_table(tb)
-        if res:
-            return res
-    if len(_NAVER_DIAG) < 3:
-        title = re.search(r"<title>(.*?)</title>", html, re.S)
-        _NAVER_DIAG.append(f"{code6}: HTTP {r.status_code}, {len(html)}자, title={title.group(1).strip()[:40] if title else '-'}, cop_analysis={'있음' if i >= 0 else '없음'}")
-        print("    [진단] 네이버", _NAVER_DIAG[-1])
+    """국내 분기 실적·컨센서스(억원). ① 네이버 증권 모바일 API ② FnGuide 기업개요(분기 Highlight) ③ 네이버 금융(구 화면)"""
+    ua = {"Referer": f"https://m.stock.naver.com/domestic/stock/{code6}/finance/quarter", "Accept": "application/json, text/plain, */*"}
     try:
-        r2 = _get("https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx", tries=2,
-                  params={"cmp_cd": code6, "fin_typ": "0", "freq_typ": "Q"},
-                  headers={"Referer": f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code6}"})
-        res = _parse_fin_table(_decode_kr(r2.content))
+        r = _get(f"https://m.stock.naver.com/api/stock/{code6}/finance/quarter", tries=2, headers=ua)
+        res = _cons_from_naver_api(r.json())
         if res:
             return res
-        if len(_NAVER_DIAG) < 6:
-            _NAVER_DIAG.append(f"{code6}: 와이즈리포트 {r2.status_code}, {len(r2.content)}B")
-            print("    [진단]", _NAVER_DIAG[-1])
+        _diag(f"{code6}: 네이버API {r.status_code} {len(r.content)}B 구조={list(r.json())[:4] if r.content[:1] == b'{' else r.text[:60]}")
     except Exception as e:  # noqa
-        print("    [진단] 와이즈리포트 실패", code6, str(e)[:60])
+        _diag(f"{code6}: 네이버API 실패 {str(e)[:70]}")
+    try:
+        r = _get("https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp", tries=2, params={"pGB": "1", "gicode": "A" + code6, "cID": "", "MenuYn": "Y", "ReportGB": "", "NewMenuID": "101", "stkGb": "701"},
+                 headers={"Referer": "https://comp.fnguide.com/"})
+        html = _decode_kr(r.content)
+        for sec in ("highlight_D_Q", "highlight_B_Q"):  # 연결 분기 → 별도 분기
+            i = html.find(f'id="{sec}"')
+            if i >= 0:
+                res = _parse_fin_table(html[i: html.find("</table>", i)])
+                if res:
+                    return res
+        _diag(f"{code6}: FnGuide {r.status_code} {len(html)}자 highlight={'있음' if 'highlight_D_Q' in html else '없음'}")
+    except Exception as e:  # noqa
+        _diag(f"{code6}: FnGuide 실패 {str(e)[:70]}")
+    try:
+        r = _get(f"https://finance.naver.com/item/main.naver?code={code6}", tries=1, headers={"Referer": "https://finance.naver.com/"})
+        html = _decode_kr(r.content)
+        i = html.find("cop_analysis")
+        if i >= 0:
+            res = _parse_fin_table(html[i: html.find("</table>", i)])
+            if res:
+                return res
+    except Exception:
+        pass
     return None
 
 
