@@ -898,28 +898,78 @@ def fetch_kr_earnings():
     return out
 
 
-def fetch_naver_consensus(code6):
-    """네이버 금융 '기업실적분석' 표 — 분기 매출·영업이익·순이익 (E는 컨센서스, 억원)"""
-    html = _get(f"https://finance.naver.com/item/main.naver?code={code6}", tries=2).content.decode("euc-kr", errors="replace")
-    i = html.find("cop_analysis")
-    if i < 0:
-        return None
-    tb = html[i: html.find("</table>", i)]
+def _decode_kr(content):
+    """네이버·와이즈리포트 페이지 인코딩(UTF-8/EUC-KR) 자동 판별"""
+    for enc in ("utf-8", "cp949"):
+        try:
+            t = content.decode(enc)
+            if "영업이익" in t or "매출" in t:
+                return t
+        except UnicodeDecodeError:
+            pass
+    return content.decode("cp949", errors="replace")
+
+
+def _parse_fin_table(tb):
+    """재무표 HTML → {'q': [기간...], 'sales': [...], 'op': [...], 'np': [...]} (분기 마지막 6개)"""
     txt = lambda h: re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", h))
-    thead = re.search(r"<thead>(.*?)</thead>", tb, re.S)
-    trs = re.findall(r"<tr[^>]*>(.*?)</tr>", thead.group(1), re.S) if thead else []
-    hdr = [txt(x) for x in re.findall(r"<th[^>]*>(.*?)</th>", trs[1], re.S)] if len(trs) > 1 else []
+    per_re = re.compile(r"(20\d{2})[./](\d{2})")
+    hdr = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tb, re.S):
+        cells = [txt(x) for x in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", tr, re.S)]
+        ps = [c for c in cells if per_re.search(c)]
+        if len(ps) >= 4:
+            hdr = [per_re.search(c).group(1) + "." + per_re.search(c).group(2) + ("(E)" if "E" in c or "추정" in c else "") for c in ps]
+            break
     rows = {}
-    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tb[tb.find("<tbody"):], re.S):
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tb, re.S):
         th = re.search(r"<th[^>]*>(.*?)</th>", tr, re.S)
-        if th:
-            rows[txt(th.group(1))] = [txt(x) for x in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
-    if len(hdr) < 10 or "영업이익" not in rows:
+        if not th:
+            continue
+        lab = txt(th.group(1))
+        for key, names in (("sales", ("매출액", "영업수익", "순영업수익", "매출액(수익)")), ("op", ("영업이익",)), ("np", ("당기순이익", "지배주주순이익"))):
+            if key not in rows and any(lab.startswith(n) for n in names) and "률" not in lab and "발표" not in lab:
+                rows[key] = [txt(x) for x in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+    if len(hdr) < 4 or "op" not in rows:
         return None
-    q = hdr[-6:]
-    num = lambda v: _ffnum(v) if v not in ("", "-") else None
-    pick = lambda k: [num(x) for x in rows.get(k, [None] * 10)[-6:]]
-    return {"q": q, "sales": pick("매출액"), "op": pick("영업이익"), "np": pick("당기순이익")}
+    n = min(len(hdr), len(rows["op"]))
+    num = lambda v: _ffnum(v) if v not in ("", "-", "N/A") else None
+    pick = lambda k: [num(x) for x in rows.get(k, [""] * n)[:n]][-6:]
+    return {"q": hdr[:n][-6:], "sales": pick("sales"), "op": pick("op"), "np": pick("np")}
+
+
+_NAVER_DIAG = []
+
+
+def fetch_naver_consensus(code6):
+    """분기 매출·영업이익·순이익 컨센서스(억원). ① 네이버 금융 기업실적분석 ② 와이즈리포트(네이버 기업정보) 분기 재무"""
+    r = _get(f"https://finance.naver.com/item/main.naver?code={code6}", tries=2,
+             headers={"Referer": "https://finance.naver.com/", "Accept-Language": "ko-KR,ko;q=0.9"})
+    html = _decode_kr(r.content)
+    i = html.find("cop_analysis")
+    if i >= 0:
+        tb = html[i: html.find("</table>", i)]
+        # 네이버 표는 연간 4칸 + 분기 6칸 → 분기만 사용
+        res = _parse_fin_table(tb)
+        if res:
+            return res
+    if len(_NAVER_DIAG) < 3:
+        title = re.search(r"<title>(.*?)</title>", html, re.S)
+        _NAVER_DIAG.append(f"{code6}: HTTP {r.status_code}, {len(html)}자, title={title.group(1).strip()[:40] if title else '-'}, cop_analysis={'있음' if i >= 0 else '없음'}")
+        print("    [진단] 네이버", _NAVER_DIAG[-1])
+    try:
+        r2 = _get("https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx", tries=2,
+                  params={"cmp_cd": code6, "fin_typ": "0", "freq_typ": "Q"},
+                  headers={"Referer": f"https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code6}"})
+        res = _parse_fin_table(_decode_kr(r2.content))
+        if res:
+            return res
+        if len(_NAVER_DIAG) < 6:
+            _NAVER_DIAG.append(f"{code6}: 와이즈리포트 {r2.status_code}, {len(r2.content)}B")
+            print("    [진단]", _NAVER_DIAG[-1])
+    except Exception as e:  # noqa
+        print("    [진단] 와이즈리포트 실패", code6, str(e)[:60])
+    return None
 
 
 def _kr_quarter(title):
